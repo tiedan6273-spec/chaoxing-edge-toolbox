@@ -8,9 +8,11 @@ import {
   type QuestionReviewRequest, type QuestionReviewResult,
 } from './review';
 import type { PacingWait } from '../answer-pacing/scheduler';
+import type { HistoryClient } from '../activity/history';
+import { digest } from '../activity/types';
 import type {
   AnswerControlSnapshot, AnswerPageCommand, AnswerPaper, AnswerResult, AnswerRow, AnswerSourceMode, AnswerSourcesStatus, ApplicableAnswer, CompletionPolicy,
-  ImportedAnswer, PreparedQuestion, QuestionAnswerController, QuestionAnswerState, QuestionTarget,
+  ImportedAnswer, PreparedQuestion, QuestionAnswerController, QuestionAnswerState, QuestionTarget, AnswerMode,
 } from './types';
 
 interface Dependencies {
@@ -22,6 +24,7 @@ interface Dependencies {
   review?(request: QuestionReviewRequest, signal: AbortSignal, progress: (text: string) => void, status?: (text: string) => void): Promise<QuestionReviewResult>;
   waitBeforeFill?: PacingWait;
   watchInterval?: number;
+  history?: HistoryClient;
 }
 export interface ChapterAnswerController extends QuestionAnswerController {
   runChapter(target: StudyTarget, signal: AbortSignal, policy: CompletionPolicy): Promise<StudyTaskOutcome>;
@@ -34,6 +37,8 @@ interface Run {
   imported?: Map<string, ImportedAnswer>;
   importSource?: 'import' | 'local-bank';
   kind?: 'answer' | 'review';
+  forceReview?: boolean;
+  mode?: AnswerMode; ids?: string[]; fresh?: boolean; useResult?: boolean;
 }
 const identity = (target: QuestionTarget) => ({ documentKey: target.documentKey, scopeKey: target.scopeKey, key: target.question.key, fingerprint: target.question.fingerprint });
 const rowId = (target: QuestionTarget) => `${target.frameId}:${target.documentId ?? ''}:${target.documentKey}:${target.scopeKey}:${target.question.key}`;
@@ -43,7 +48,7 @@ const cancelled = () => new DOMException('答题已暂停。', 'AbortError');
 export function createQuestionAnswerController(deps: Dependencies): ChapterAnswerController {
   const canPreview = deps.canPreview ?? deps.isEnabled;
   let state: QuestionAnswerState = {
-    phase: 'idle', running: false, source: null, rows: [], followProgress: true,
+    phase: 'idle', running: false, source: null, rows: [], followProgress: true, mode: 'fill', range: 'all',
     message: '打开测验、作业或考试后，点击开始答题。', reviewing: false,
   };
   let run: Run | undefined;
@@ -52,6 +57,11 @@ export function createQuestionAnswerController(deps: Dependencies): ChapterAnswe
   let previewRevision = 0;
   let previewTask: Promise<void> | undefined;
   let previewRequested = false;
+  const results = new Map<string, { fingerprint: string; source: AnswerSourceMode; controlVersion: string; result: AnswerResult }>();
+  const reviewCache = new Map<string, QuestionReviewResult>();
+  let sourceSignature = '';
+  let lastRange: { mode: AnswerMode; range: QuestionAnswerState['range']; ids: string[] } | undefined;
+  let historyRevision = 0;
   const listeners = new Set<(state: QuestionAnswerState) => void>();
   const getState = (): QuestionAnswerState => structuredClone(state);
   const emit = (update: Partial<QuestionAnswerState>) => {
@@ -63,6 +73,12 @@ export function createQuestionAnswerController(deps: Dependencies): ChapterAnswe
     if (disposed || run !== current || current.abort.signal.aborted || !deps.isEnabled()) throw cancelled();
   };
   const updateRow = (id: string, patch: Partial<AnswerRow>) => emit({ rows: state.rows.map(row => row.id === id ? { ...row, ...patch } : row) });
+  function invalidateResults(): void {
+    reviewCache.clear();
+    emit({ reviewAvailable: false, reviewProgress: undefined, rows: state.rows.map(row => ({ ...row, review: undefined })) });
+    results.clear();
+    emit({ rows: state.rows.map(row => ({ ...row, resultApplicable: false })) });
+  }
   function publishScope(scope: AnswerFrameSnapshot[]): AnswerRow[] {
     const previous = new Map(state.rows.map(row => [row.id, row]));
     const rows: AnswerRow[] = [];
@@ -76,7 +92,7 @@ export function createQuestionAnswerController(deps: Dependencies): ChapterAnswe
         rows.push({ id, target, phase: retained?.phase ?? (question.supported ? 'pending' : 'unsupported'),
           message: retained?.message ?? (question.supported ? '等待处理' : question.reason || '当前题型暂不支持。'),
           text: retained?.text ?? '', source: retained?.source, tags: retained?.tags,
-          currentAnswer: retained?.currentAnswer, readOnly: snapshot.complete || !question.supported,
+          resultAnswer: retained?.resultAnswer, resultApplicable: retained?.resultApplicable, currentAnswer: retained?.currentAnswer, readOnly: snapshot.complete || !question.supported,
           review: snapshot.complete ? undefined : retained?.review });
         return id;
       });
@@ -86,10 +102,13 @@ export function createQuestionAnswerController(deps: Dependencies): ChapterAnswe
     });
     const samePaper = JSON.stringify([state.papers?.map(paper => [paper.id, paper.rowIds]), state.rows.map(row => row.target.question.fingerprint)])
       === JSON.stringify([papers.map(paper => [paper.id, paper.rowIds]), rows.map(row => row.target.question.fingerprint)]);
+    for (const [id, cached] of results) if (!rows.some(row => row.id === id && row.target.question.fingerprint === cached.fingerprint)) results.delete(id);
     emit({ rows, papers, previewStale: false, selectedId: rows.some(row => row.id === state.selectedId) ? state.selectedId : rows[0]?.id,
       activeId: samePaper && rows.some(row => row.id === state.activeId) ? state.activeId : undefined,
       followProgress: samePaper ? state.followProgress : true,
-      completion: samePaper ? state.completion : undefined });
+      completion: samePaper ? state.completion : undefined,
+      ...(!samePaper ? { reviewAvailable: false, reviewProgress: undefined } : {}),
+      ...(!run && scope.length && scope.every(frame => frame.snapshot.complete) ? { mode: 'search' as const } : {}) });
     return rows;
   }
   function updateControl(row: AnswerRow, control: AnswerControlSnapshot, preservePhase = false): void {
@@ -98,10 +117,11 @@ export function createQuestionAnswerController(deps: Dependencies): ChapterAnswe
     const retained = state.rows.find(item => item.id === row.id);
     const stillFilled = retained?.phase === 'filled' && JSON.stringify(retained.currentAnswer) === JSON.stringify(control.answer);
     const answerChanged = retained?.currentAnswer !== undefined && !sameApplicableAnswer(retained.currentAnswer, control.answer);
+    if (answerChanged) emit({ reviewAvailable: false, reviewProgress: undefined });
     if (answerChanged && state.completion === 'saved') emit({ completion: 'unconfirmed' });
     updateRow(row.id, { currentAnswer: control.answer, readOnly,
       review: answerChanged || !control.ready || completed ? undefined : retained?.review,
-      ...(!preservePhase ? { phase: control.hasContent ? (stillFilled ? 'filled' : control.complete ? 'existing' : 'needs-review')
+      ...(!preservePhase ? { phase: retained?.phase === 'searched' && retained.resultAnswer ? 'searched' : control.hasContent ? (stillFilled ? 'filled' : control.complete ? 'existing' : 'needs-review')
         : !row.target.question.supported ? 'unsupported' : 'pending',
       message: completed ? '平台已完成，本页仅供阅览。' : readOnly ? control.error || '当前题目只可阅览。'
         : control.hasContent ? control.complete ? '保留页面已有答案。' : '页面已有部分答案，请检查。' : '尚未填写。' } : {}) });
@@ -130,13 +150,20 @@ export function createQuestionAnswerController(deps: Dependencies): ChapterAnswe
       if (!valid()) return;
       const rows = publishScope(frames.filter(frame => frame.snapshot.scene !== 'unsupported'));
       await readPreviewRows(rows, signal, valid);
+      if (valid() && deps.history) {
+        const revision = ++historyRevision;
+        try {
+          const records = await deps.history.load(rows.map(row => row.target.question));
+          if (valid() && revision === historyRevision) emit({ history: { available: records.filter(record => !rows[record.index]?.resultAnswer).length, busy: false, message: '记录仅保存在本机；恢复不会填写页面。' } });
+        } catch { if (valid() && revision === historyRevision) emit({ history: { available: 0, busy: false, message: '历史读取失败，可重新识别；当前结果仍可导出。' } }); }
+      }
       if (valid()) emit({ message: rows.length ? `已读取当前加载的 ${rows.length} 题，可先阅览再开始答题。` : '未识别到已加载题目，请进入测验或作业后刷新阅览。' });
     } catch (error) {
       if (valid()) emit({ rows: state.rows.map(row => ({ ...row, readOnly: true })), message: error instanceof Error ? error.message : '题目阅览失败，请刷新。' });
     } finally { if (valid()) emit({ previewing: false }); }
   }
   function preview(): void {
-    if (disposed || run || !canPreview()) return;
+    if (disposed || run || state.history?.busy || !canPreview()) return;
     ++previewRevision;
     previewRequested = true;
     emit({ previewing: true });
@@ -161,6 +188,9 @@ export function createQuestionAnswerController(deps: Dependencies): ChapterAnswe
     try {
       const sources = await deps.getSources();
       if (disposed || revision !== sourcesRevision) return;
+      const signature = JSON.stringify(sources);
+      if (sourceSignature && signature !== sourceSignature) invalidateResults();
+      sourceSignature = signature;
       emit({ sources, source: sources.selection });
       return sources;
     } catch {
@@ -187,12 +217,13 @@ export function createQuestionAnswerController(deps: Dependencies): ChapterAnswe
     const source = current.source;
     if (!source && !current.imported) throw new Error('请先选择答题来源。');
     const target = row.target;
+    const searchOnly = current.mode === 'search';
     if (!target.question.supported) { updateRow(row.id, { phase: 'unsupported', message: target.question.reason || '当前题目结构暂不支持，未填写。' }); return; }
     const before = await read(current, target);
     updateControl(row, before, true);
-    if (!before.ready) { updateRow(row.id, { phase: 'unsupported', message: before.error || '答题控件尚未就绪。' }); return; }
+    if (!searchOnly && !before.ready) { updateRow(row.id, { phase: 'unsupported', message: before.error || '答题控件尚未就绪。' }); return; }
     current.checkedVersions?.set(row.id, before.version);
-    if (before.hasContent && !current.replace) {
+    if (!searchOnly && before.hasContent && !current.replace) {
       updateRow(row.id, { phase: before.complete ? 'existing' : 'needs-review', message: before.complete ? '保留已有答案。' : '本题已有部分答案，保留原内容；请检查或确认覆盖。' });
       return;
     }
@@ -200,7 +231,13 @@ export function createQuestionAnswerController(deps: Dependencies): ChapterAnswe
       const plan = planAnswerSource(source, state.sources, Boolean(target.question.textRecognition), target.question.kind === 'program');
       if (!plan.first) { updateRow(row.id, { phase: 'needs-review', message: plan.message }); return; }
     }
-    updateRow(row.id, { phase: 'querying', message: '正在获取答案…', text: '', source: undefined, tags: undefined });
+    const cached = results.get(row.id);
+    const reusable = !current.fresh && cached && cached.source === source && cached.fingerprint === target.question.fingerprint ? cached.result : undefined;
+    if (current.useResult && !reusable) throw new Error('参考答案已失效，请重新搜题后应用。');
+    if (current.useResult && cached?.controlVersion !== before.version) throw new Error('搜题后页面答案已变化，请重新读取并搜索，未覆盖你的修改。');
+    if (current.fresh) results.delete(row.id);
+    updateRow(row.id, { phase: 'querying', message: reusable ? '正在核对已获取的答案…' : '正在获取答案…',
+      ...(!reusable ? { text: '', source: undefined, tags: undefined, resultAnswer: undefined, resultApplicable: false } : {}) });
     let monitoring = false;
     let watching = true;
     let changed: Error | undefined;
@@ -209,7 +246,7 @@ export function createQuestionAnswerController(deps: Dependencies): ChapterAnswe
       monitoring = true;
       void read(current, target).then(snapshot => {
         if (!watching) return;
-        if (!snapshot.ready || snapshot.version !== before.version) { updateControl(row, snapshot, true); throw new Error('题目或已有答案已变化，已暂停，未覆盖你的修改。'); }
+        if (!searchOnly && (!snapshot.ready || snapshot.version !== before.version)) { updateControl(row, snapshot, true); throw new Error('题目或已有答案已变化，已暂停，未覆盖你的修改。'); }
       }).catch(error => {
         if (watching && !current.abort.signal.aborted && run === current) {
           changed = error instanceof Error ? error : new Error('题目已变化。');
@@ -219,7 +256,8 @@ export function createQuestionAnswerController(deps: Dependencies): ChapterAnswe
     }, deps.watchInterval ?? 800);
     try {
       let result: AnswerResult;
-      if (current.imported) {
+      if (reusable) result = structuredClone(reusable);
+      else if (current.imported) {
         const imported = current.imported.get(row.id);
         const answer = imported && normalizeAnswer(target.question, imported.answer);
         if (!answer) throw new Error('导入答案未通过题型与选项核对，未填写。');
@@ -227,16 +265,28 @@ export function createQuestionAnswerController(deps: Dependencies): ChapterAnswe
       } else {
         const prepared: PreparedQuestion = target.question.images.length
           ? (await page(current, target, { action: 'images', ...identity(target) })).prepared!
-          : { question: target.question, images: [], suggestionTitle: '', suggestionOptions: '' };
+          : { question: structuredClone(target.question), images: [], suggestionTitle: '', suggestionOptions: '' };
         if (!prepared) throw new Error('图片未能完整读取，本题未请求答案。');
-        result = await deps.generate(prepared, source!, current.abort.signal, text => {
+        const request = { ...prepared, question: { ...prepared.question } };
+        delete request.question.reviewData;
+        result = await deps.generate(request, source!, current.abort.signal, text => {
           if (run === current && !current.abort.signal.aborted) updateRow(row.id, { text });
         }, message => { if (run === current && !current.abort.signal.aborted) updateRow(row.id, { message }); });
       }
       check(current);
-      updateRow(row.id, { text: result.text, source: result.source, tags: result.tags });
+      if (result.status === 'answer' && result.answer && !current.imported) results.set(row.id, { fingerprint: target.question.fingerprint, source: source!, controlVersion: before.version, result: structuredClone(result) });
+      updateRow(row.id, { text: result.text, source: result.source, tags: result.tags,
+        resultAnswer: result.status === 'answer' && result.answer ? structuredClone(result.answer) : undefined,
+        resultApplicable: result.status === 'answer' && Boolean(result.answer) });
       if (result.status !== 'answer' || !result.answer) {
         updateRow(row.id, { phase: 'needs-review', message: result.message || '没有可可靠填写的答案，请手动处理。' });
+        return;
+      }
+      if (searchOnly) {
+        const live = await read(current, target);
+        const saved = results.get(row.id); if (saved) saved.controlVersion = live.version;
+        updateControl(row, live, true);
+        updateRow(row.id, { phase: 'searched', message: result.message || '已获取参考答案；页面答案未修改。' });
         return;
       }
       await deps.waitBeforeFill?.(startedAt, current.abort.signal, message => updateRow(row.id, { message }));
@@ -247,10 +297,13 @@ export function createQuestionAnswerController(deps: Dependencies): ChapterAnswe
       // Stop polling before our own mutation; the page adapter performs the final compare-and-write.
       watching = false;
       clearInterval(watch);
-      const written = await page(current, target, {
+      const written = result.localProof ? await deps.runtime.page(target, {
+        action: 'write', ...identity(target), expectedVersion: before.version, answer: result.answer, replace: Boolean(current.replace),
+      }, current.abort.signal, result.localProof) : await page(current, target, {
         action: 'write', ...identity(target), expectedVersion: before.version, answer: result.answer, replace: Boolean(current.replace),
       });
-      if (!written.control?.complete) throw new Error('填写后的状态未通过核对，请检查本题。');
+      check(current);
+      if (!written.ok || !written.control?.complete) throw new Error(written.error || '填写后的状态未通过核对，请检查本题。');
       current.checkedVersions?.set(row.id, written.control.version);
       updateRow(row.id, {
         phase: 'filled', currentAnswer: written.control.answer, readOnly: false,
@@ -273,7 +326,7 @@ export function createQuestionAnswerController(deps: Dependencies): ChapterAnswe
     run = current;
     emit({
       running: true, reviewing: true, previewing: false, followProgress: true, completion: undefined,
-      phase: 'scanning', message: '正在重新读取整卷和当前答案…', reviewProgress: '正在重新读取整卷…',
+      phase: 'scanning', message: '步骤 1/3 · 读取页面答案（本地读取）…', reviewProgress: '步骤 1/3 · 读取页面答案…',
       reviewError: undefined, rows: state.rows.map(row => ({ ...row, review: undefined })),
     });
     try {
@@ -304,11 +357,11 @@ export function createQuestionAnswerController(deps: Dependencies): ChapterAnswe
         throw new Error('整卷包含图片题，但当前模型未启用图片输入能力；请先在 API 设置中确认模型能力。');
       }
 
-      emit({ phase: 'running', message: '正在从页面重新核对全部答案；未完成时不会发送复检。', reviewProgress: `正在核对页面答案 0/${rows.length}` });
+      emit({ phase: 'running', message: '步骤 1/3 · 本地读取当前答案；随后只发送一次整卷请求。', reviewProgress: `本地读取 0/${rows.length}` });
       const baseline = new Map<string, ApplicableAnswer>();
       for (const [index, row] of rows.entries()) {
         check(current);
-        emit({ reviewProgress: `正在核对页面答案 ${index + 1}/${rows.length}` });
+        emit({ reviewProgress: `步骤 1/3 · 本地读取 ${index + 1}/${rows.length}` });
         const control = await read(current, row.target);
         updateControl(row, control, true);
         if (!control.ready) throw new Error(`第 ${row.target.question.number} 题答题控件未就绪：${control.error || '请检查页面。'}`);
@@ -340,9 +393,12 @@ export function createQuestionAnswerController(deps: Dependencies): ChapterAnswe
       }
 
       const request: QuestionReviewRequest = { batchId: crypto.randomUUID(), items };
-      emit({ reviewProgress: `正在将 ${rows.length} 道题一次性发送给 AI 复检…`, message: '整卷复检请求中；可随时停止。' });
-      const result = await review(request, current.abort.signal, text => {
-        if (run === current && !current.abort.signal.aborted) emit({ reviewProgress: `正在接收 AI 复检结果…（${text.length} 字符）` });
+      const cacheKey = await digest([rows.map(row => [row.id, row.target.question.fingerprint]), items]);
+      check(current);
+      const cached = current.forceReview ? undefined : reviewCache.get(cacheKey);
+      emit({ reviewProgress: cached ? '答案未变，正在复用本页复检结果…' : `步骤 2/3 · 一次性请求 ${rows.length} 题的 AI 复检…`, message: cached ? '正在读取已完成的复检，无新增 AI 请求。' : 'AI 复检请求中；可随时停止。' });
+      const result = cached ?? await review(request, current.abort.signal, text => {
+        if (run === current && !current.abort.signal.aborted) emit({ reviewProgress: `步骤 2/3 · 接收 AI 结果（同一请求，${text.length} 字符）…` });
       }, text => {
         if (run === current && !current.abort.signal.aborted) emit({ reviewProgress: text });
       });
@@ -350,7 +406,7 @@ export function createQuestionAnswerController(deps: Dependencies): ChapterAnswe
 
       // A model call can take minutes. Re-read every answer before publishing any finding.
       for (const [index, row] of rows.entries()) {
-        emit({ reviewProgress: `正在确认页面答案未变化 ${index + 1}/${rows.length}` });
+        emit({ reviewProgress: `步骤 3/3 · 本地确认页面未变化 ${index + 1}/${rows.length}` });
         const control = await read(current, row.target);
         updateControl(row, control, true);
         const before = baseline.get(row.id)!;
@@ -359,6 +415,8 @@ export function createQuestionAnswerController(deps: Dependencies): ChapterAnswe
         }
       }
       check(current);
+      reviewCache.delete(cacheKey); reviewCache.set(cacheKey, structuredClone(result));
+      if (reviewCache.size > 3) reviewCache.delete(reviewCache.keys().next().value!);
       const outcomes = new Map(result.items.map(item => [item.questionId, item]));
       const rowIds = new Map(rows.map((row, index) => [row.id, `q-${index + 1}`]));
       const suspect = result.items.filter(item => item.status === 'suspect').length;
@@ -374,9 +432,10 @@ export function createQuestionAnswerController(deps: Dependencies): ChapterAnswe
           return { ...row, review: { status: 'uncertain', reason: outcome.reason! } };
         }),
         phase: 'complete', message: suspect || uncertain
-          ? `AI 整卷复检完成：${suspect} 道疑似错误，${uncertain} 道需人工确认。页面答案未被修改。`
+          ? `AI 整卷复检完成：${suspect} 道答案不一致，${uncertain} 道需人工确认。页面答案未被修改。`
           : 'AI 整卷复检完成：未发现需要标记的题目。页面答案未被修改。',
-        reviewProgress: `已复检 ${rows.length} 题`, reviewError: undefined,
+        reviewProgress: `已复检 ${rows.length} 题 · ${cached ? '复用结果，无新增请求' : '本次 AI 请求 1 次'}`,
+        reviewAvailable: true, reviewError: undefined,
       });
     } catch (error) {
       const message = current.invalidated ? '题目页面已更换，请重新读取题目。' : error instanceof Error ? error.message : '整卷复检失败，请检查页面。';
@@ -407,6 +466,7 @@ export function createQuestionAnswerController(deps: Dependencies): ChapterAnswe
     current.checkedVersions = new Map();
     emit({
       running: true, reviewing: false, previewing: false, followProgress: true, completion: undefined,
+      ...(current.mode ? { mode: current.mode } : {}),
       phase: 'scanning', message: '正在读取当前页面各题目框架…', reviewProgress: undefined, reviewError: undefined,
     });
     let activeId: string | undefined;
@@ -428,14 +488,15 @@ export function createQuestionAnswerController(deps: Dependencies): ChapterAnswe
           }
         }
       }
-      if (scope.length && scope.every(frame => frame.snapshot.complete)) {
+      if (current.mode !== 'search' && scope.length && scope.every(frame => frame.snapshot.complete)) {
         await readPreviewRows(allRows, current.abort.signal, () => run === current && !current.abort.signal.aborted);
         check(current);
         emit({ phase: 'complete', message: '平台显示当前题目已完成，无需重新填写。' });
         return { status: 'acted', message: '章节测验已完成。' };
       }
-      const rows = allRows.filter(row => !scope.find(frame => frame.frameId === row.target.frameId && frame.documentId === row.target.documentId)?.snapshot.complete);
+      const rows = allRows.filter(row => current.mode === 'search' || !scope.find(frame => frame.frameId === row.target.frameId && frame.documentId === row.target.documentId)?.snapshot.complete);
       if (!rows.length) throw new Error('没有识别到可用题目子页面。请等待内容加载；未知页面模板暂不支持。');
+      if (current.ids?.some(id => !allRows.some(row => row.id === id && row.target.question.fingerprint === previous.get(id)?.target.question.fingerprint))) throw new Error('所选范围的题目已变化，请重新识别并选择起点。');
       if (current.onlyId && !rows.some(row => row.id === current.onlyId && row.target.question.fingerprint === previous.get(row.id)?.target.question.fingerprint)) throw new Error('目标题目已变化，请重新开始读取。');
       if (!current.imported) {
         const sources = await refreshSources();
@@ -452,9 +513,9 @@ export function createQuestionAnswerController(deps: Dependencies): ChapterAnswe
         }
         current.source = sources.selection;
       }
-      emit({ phase: 'running', message: current.imported ? '正在填写已核对的导入答案；已有内容默认保留。' : '正在逐题获取并填写答案；可随时暂停。' });
+      emit({ phase: 'running', message: current.mode === 'search' ? '正在逐题搜索参考答案；不会填写或交卷。' : current.imported ? '正在填写已核对的导入答案；已有内容默认保留。' : '正在逐题获取并填写答案；可随时暂停。' });
       for (const row of rows) {
-        if ((current.onlyId && row.id !== current.onlyId) || (current.imported && !current.imported.has(row.id))) {
+        if ((current.ids && !current.ids.includes(row.id)) || (current.onlyId && row.id !== current.onlyId) || (current.imported && !current.imported.has(row.id))) {
           const old = previous.get(row.id);
           if (old?.target.question.fingerprint === row.target.question.fingerprint) updateRow(row.id, old);
           continue;
@@ -465,7 +526,7 @@ export function createQuestionAnswerController(deps: Dependencies): ChapterAnswe
         activeId = undefined;
       }
       check(current);
-      if (!current.chapter) { emit({ phase: 'complete', message: '本轮填写结束，请检查答案后自行保存或提交。' }); return; }
+      if (!current.chapter) { emit({ phase: 'complete', message: current.mode === 'search' ? '所选范围搜题结束；参考答案可导出，页面未被填写。' : '本轮填写结束，请检查答案后自行保存或提交。' }); return; }
       if (current.policy === 'stay') {
         emit({ phase: 'complete', message: '章节测验填写结束，已停留等待检查。' });
         return { status: 'attention', message: '章节测验已填写，请检查后手动保存或提交。' };
@@ -508,8 +569,8 @@ export function createQuestionAnswerController(deps: Dependencies): ChapterAnswe
     }
   }
   const launch = (options: Partial<Run> = {}) => {
-    if (run || state.sourceSaving) return;
-    const current: Run = { ...options, abort: new AbortController() };
+    if (run || state.sourceSaving || state.history?.busy) return;
+    const current: Run = { mode: state.mode ?? 'fill', ...options, abort: new AbortController() };
     const operation = current.kind === 'review' ? executeReview(current) : execute(current);
     void operation.catch(error => {
       const message = error instanceof Error ? error.message : '无法开始答题。';
@@ -520,6 +581,7 @@ export function createQuestionAnswerController(deps: Dependencies): ChapterAnswe
     });
   };
   const stop = () => {
+    ++historyRevision;
     const reviewing = run?.kind === 'review';
     ++previewRevision;
     previewRequested = false;
@@ -527,12 +589,15 @@ export function createQuestionAnswerController(deps: Dependencies): ChapterAnswe
     deps.runtime.cancel();
     emit({
       previewing: false, phase: 'paused', reviewing: false,
+      ...(state.history?.busy ? { history: { ...state.history, busy: false, message: '记录操作已停止，请重新识别。' } } : {}),
       message: reviewing ? '已停止整卷复检；页面答案未被修改。' : '已暂停；已填写内容保留。',
       ...(reviewing ? { reviewProgress: undefined, reviewError: undefined } : {}),
     });
   };
   const unsubscribeInvalidation = deps.runtime.subscribeInvalidation?.(() => {
     if (disposed) return;
+    invalidateResults(); lastRange = undefined;
+    ++historyRevision;
     ++previewRevision;
     previewRequested = false;
     if (run) { run.invalidated = true; stop(); }
@@ -540,17 +605,75 @@ export function createQuestionAnswerController(deps: Dependencies): ChapterAnswe
       rows: state.rows.map(row => ({ ...row, readOnly: true, review: undefined })),
       previewing: false, previewStale: true, reviewing: false, reviewProgress: undefined, reviewError: undefined,
       message: '题目页面已更换，请重新读取题目。',
+      history: undefined,
     });
   });
   void refreshSources();
   return {
     getState,
     subscribe(listener) { listeners.add(listener); listener(getState()); return () => listeners.delete(listener); },
-    start() { launch(); }, stop,
+    start() {
+      if (state.previewStale) return;
+      if (!state.rows.length) { if (!state.range || state.range === 'all') launch(); return; }
+      const mode = state.mode ?? 'fill'; const range = state.range ?? 'all';
+      const index = Math.max(0, state.rows.findIndex(row => row.id === state.selectedId));
+      const ids = state.phase === 'paused' && lastRange?.mode === mode && lastRange.range === range ? lastRange.ids
+        : (range === 'current' ? [state.rows[index]] : range === 'forward' ? state.rows.slice(index) : state.rows).map(row => row.id);
+      lastRange = { mode, range, ids };
+      launch({ ids });
+    }, stop,
+    restoreHistory() {
+      if (!deps.history || disposed || run || state.previewing || state.previewStale || state.sourceSaving || state.history?.busy || !canPreview()) return;
+      const revision = ++historyRevision;
+      const baseline = state.rows.map(row => ({ id: row.id, fingerprint: row.target.question.fingerprint }));
+      const valid = () => !disposed && !run && !state.previewStale && revision === historyRevision
+        && JSON.stringify(baseline) === JSON.stringify(state.rows.map(row => ({ id: row.id, fingerprint: row.target.question.fingerprint })));
+      emit({ history: { available: state.history?.available ?? 0, busy: true, message: '正在核对当前题目和历史记录…' } });
+      void (async () => {
+        const records = await deps.history!.load(state.rows.map(row => row.target.question));
+        if (!valid()) return;
+        const updates: Array<{ id: string; result: AnswerResult; control: AnswerControlSnapshot; reusable: boolean }> = [];
+        for (const record of records) {
+          const row = state.rows[record.index];
+          if (!row || row.resultAnswer) continue;
+          const response = await deps.runtime.page(row.target, { action: 'read', ...identity(row.target) }, new AbortController().signal);
+          if (!valid()) return;
+          if (!response.ok || !response.control) continue;
+          updates.push({ id: row.id, result: record.result, control: response.control, reusable: record.reusable });
+        }
+        if (!valid()) return;
+        for (const item of updates) {
+          const row = state.rows.find(row => row.id === item.id)!;
+          updateControl(row, item.control, true);
+          if (item.reusable && state.source) results.set(row.id, { fingerprint: row.target.question.fingerprint, source: state.source, controlVersion: item.control.version, result: structuredClone(item.result) });
+          updateRow(row.id, { phase: item.reusable ? 'searched' : 'needs-review', text: item.result.text, source: item.result.source,
+            resultAnswer: item.result.answer, resultApplicable: item.reusable && Boolean(state.source),
+            message: item.reusable ? '已恢复本机参考结果；页面未填写。' : '来源配置或题库已变化，历史仅供查看；请重新搜题。' });
+        }
+        lastRange = undefined;
+        emit({ mode: 'search', range: 'all', phase: 'paused', history: { available: 0, busy: false, message: `已恢复 ${updates.length} 题；继续搜索会复用仍有效的结果。` },
+          selectedId: state.rows.find(row => !results.has(row.id))?.id ?? state.rows[0]?.id,
+          message: '历史结果已恢复。确认处理范围后继续搜索，或切换模式显式填写。' });
+      })().catch(() => { if (valid()) emit({ history: { available: state.history?.available ?? 0, busy: false, message: '恢复失败，请重新识别后再试。' } }); });
+    },
+    clearHistory() {
+      if (!deps.history || run || state.history?.busy) return;
+      const revision = ++historyRevision;
+      emit({ history: { available: state.history?.available ?? 0, busy: true, message: '正在删除当前页面历史…' } });
+      void deps.history.clear().then(() => { if (!disposed && revision === historyRevision) emit({ history: { available: 0, busy: false, message: '当前页面历史已删除；页面答案和本次结果保留。' } }); })
+        .catch(() => { if (!disposed && revision === historyRevision) emit({ history: { available: state.history?.available ?? 0, busy: false, message: '历史删除失败，请重试。' } }); });
+    },
+    setMode(mode) { if (!run && !disposed && (mode === 'fill' || mode === 'search')) { lastRange = undefined; emit({ mode }); } },
+    setRange(range) { if (!run && !disposed && ['all', 'current', 'forward'].includes(range)) { lastRange = undefined; emit({ range }); } },
+    search(id) { if (!state.previewStale && state.rows.some(row => row.id === id)) launch({ mode: 'search', onlyId: id, fresh: true }); },
+    applyResult(id, replace = false) {
+      const row = state.rows.find(row => row.id === id);
+      if (!state.previewStale && row?.resultApplicable && !row.readOnly) launch({ mode: 'fill', onlyId: id, useResult: true, replace });
+    },
     preview,
-    reviewAnswers() {
+    reviewAnswers(force = false) {
       if (!deps.review || disposed || run || state.sourceSaving) return;
-      launch({ kind: 'review' });
+      launch({ kind: 'review', forceReview: force });
     },
     async applyImportedAnswers(entries, source = 'import') {
       if (disposed || run || state.sourceSaving || state.previewing || state.previewStale) throw new Error('请先结束当前任务并重新读取题目，再填写导入答案。');
@@ -571,10 +694,11 @@ export function createQuestionAnswerController(deps: Dependencies): ChapterAnswe
       if (disposed) return;
       emit({ followProgress: true, ...(!state.previewStale && state.rows.some(row => row.id === state.activeId) ? { selectedId: state.activeId } : {}) });
     },
-    retry(id, replace = false) { if (state.rows.some(row => row.id === id)) launch({ onlyId: id, replace }); },
+    retry(id, replace = false) { if (state.rows.some(row => row.id === id)) launch({ mode: 'fill', onlyId: id, replace, fresh: true }); },
     setSource(source) {
-      if (run || disposed || state.sourceSaving || !['prefer-bank', 'bank', 'ai'].includes(source)) return;
+      if (run || disposed || state.sourceSaving || !['prefer-bank', 'bank', 'ai', 'local'].includes(source)) return;
       const previous = state.source;
+      invalidateResults(); lastRange = undefined;
       ++sourcesRevision;
       emit({ source, sources: undefined, sourcesError: undefined, sourceSaving: true });
       void deps.saveSource(source).then(() => refreshSources()).catch(() => {
@@ -583,6 +707,9 @@ export function createQuestionAnswerController(deps: Dependencies): ChapterAnswe
     },
     refreshSources() { if (!run && !disposed && !state.sourceSaving) void refreshSources(); },
     settingsChanged() {
+      ++historyRevision;
+      emit({ history: undefined });
+      invalidateResults(); lastRange = undefined;
       if (run) stop();
       else { ++previewRevision; previewRequested = false; emit({ previewing: false }); }
       if (!disposed && !state.sourceSaving) void refreshSources();

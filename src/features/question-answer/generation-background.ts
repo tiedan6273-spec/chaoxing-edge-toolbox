@@ -1,6 +1,6 @@
 import { isSupportedContent } from '../../core/background-context';
 import { requireApiConfig } from '../api-settings/background';
-import { API_SETTINGS_KEY } from '../api-settings/types';
+import { API_SETTINGS_KEY, type ApiConfig } from '../api-settings/types';
 import { ModelRequestError } from '../api-settings/model-client';
 import { generateQuestionAnswer, QuestionAiAnswerError } from '../ai-answer/question-provider';
 import { requireQuestionBankConfig } from '../question-bank/background';
@@ -13,7 +13,11 @@ import { PACING_SETTINGS_KEY } from '../answer-pacing/types';
 import { isPreparedQuestion } from './protocol';
 import { generateQuestionReview, isQuestionReviewRequest, QuestionReviewError } from './review';
 import { readAnswerSourcesStatus } from './source-background';
+import { onLocalBankChanged, queryStoredLibraries } from '../local-question-bank/background';
+import { bankCourseContext } from '../local-question-bank/library-types';
+import { formatApplicableAnswer } from './answer-format';
 import { planAnswerSource } from './source-status';
+import { historyStamp, rememberResult } from '../activity/history-background';
 import { ANSWER_GENERATION_PORT, ANSWER_PREFERENCES_KEY, type AnswerResult, type AnswerSourceMode, type PreparedQuestion } from './types';
 
 export { ANSWER_GENERATION_PORT } from './types';
@@ -60,22 +64,39 @@ export function validatePreparedQuestion(value: unknown): value is PreparedQuest
   return boundedText({ ...question, images: [] });
 }
 
-async function requireAnswerEnabled(ai = false): Promise<void> {
+async function requireAnswerEnabled(ai = false, feature: 'question-answer' | 'ai-answer' = 'question-answer'): Promise<void> {
   const settings = await readStoredSettings();
-  if (!settings.enabled || !settings.features['question-answer']) throw new QuestionGenerationError('题库与 AI 答题已关闭，请先开启功能。');
+  if (!settings.enabled || !settings.features[feature]) throw new QuestionGenerationError('当前答题功能已关闭，请先开启功能。');
   if (ai && !settings.features['ai-answer']) throw new QuestionGenerationError('AI 作答已关闭，未请求模型；请启用后重试。');
 }
 
 export async function resolveQuestionAnswer(
   prepared: PreparedQuestion, source: AnswerSourceMode, signal: AbortSignal, onProgress: (text: string) => void,
-  onStatus: (text: string) => void = onProgress,
+  onStatus: (text: string) => void = onProgress, context = 'manager',
+  options: { feature?: 'ai-answer'; generateAi?: (config: ApiConfig) => Promise<AnswerResult> } = {},
 ): Promise<AnswerResult> {
-  await requireAnswerEnabled();
+  await requireAnswerEnabled(false, options.feature);
   if (signal.aborted) throw new QuestionGenerationError('已取消答题。');
-  const sources = await readAnswerSourcesStatus();
+  const sources = await readAnswerSourcesStatus(context);
+  if (!sources.selection && options.feature === 'ai-answer') sources.selection = sources.local?.enabled && sources.local.selectedCount ? 'local' : 'ai';
   if (signal.aborted) throw new QuestionGenerationError('已取消答题。');
   if (!sources.selection) throw new QuestionGenerationError('请先在答题面板选择答题来源；配置 API 不会自动选择 AI。');
   if (source !== sources.selection) throw new QuestionGenerationError('答题来源已更改，请确认当前选择后重新开始。');
+  let plan = planAnswerSource(source, sources, Boolean(prepared.question.textRecognition), prepared.question.kind === 'program');
+  if (plan.first === 'local') {
+    onStatus('正在匹配本地题库…');
+    const match = await queryStoredLibraries(prepared.question, context);
+    if (signal.aborted) throw new QuestionGenerationError('已取消答题。');
+    if (match.status === 'matched' && match.answer) return {
+      status: 'answer', source: 'local-bank', text: formatApplicableAnswer(prepared.question, match.answer), answer: match.answer,
+      message: `本地题库参考答案：${match.sources.slice(0, 5).map(item => `${item.name} · ${item.number} · ${item.position}`).join('；')}。请核对。`,
+      tags: match.sources.slice(0, 5).map(item => ({ text: item.name, title: `题号 ${item.number}；${item.position}` })),
+      localProof: { revision: match.revision, libraryIds: [...new Set(match.sources.map(item => item.libraryId))], entryIds: match.sources.map(item => item.entryId), context },
+    };
+    if (match.status === 'conflict' || !plan.fallback || source === 'local') return { status: 'no-answer', source: 'local-bank', text: '', message: match.message };
+    plan = planAnswerSource(source, { ...sources, local: undefined }, Boolean(prepared.question.textRecognition), prepared.question.kind === 'program');
+    onStatus('本地未完整匹配，正在准备所选在线来源…');
+  }
   const program = prepared.question.kind === 'program';
   if (program && source === 'bank') return {
     status: 'no-answer', source: 'bank', text: '', message: '程序题需要 AI 生成代码；请将答题来源切换为“仅 AI”或“言溪优先，AI 补充”。',
@@ -84,7 +105,6 @@ export async function resolveQuestionAnswer(
   if (incomplete && source === 'bank') return {
     status: 'no-answer', source: 'bank', text: '', message: '本题含未识别文字，未查询言溪题库；请切换为 AI 或“言溪优先，AI 补充”。',
   };
-  const plan = planAnswerSource(source, sources, incomplete, program);
   if (!plan.first) throw new QuestionGenerationError(plan.message);
   if (plan.first === 'bank') {
     const config = await requireQuestionBankConfig().catch(() => { throw new QuestionGenerationError('言溪题库配置不可用，请在设置页检查 Token 和域名授权。'); });
@@ -100,13 +120,13 @@ export async function resolveQuestionAnswer(
   } else if (source === 'prefer-bank') {
     onStatus(program ? '程序题将由 AI 生成代码…' : incomplete ? '本题含未识别文字，跳过言溪题库，正在使用 AI…' : '未配置言溪题库，正在使用 AI 答题…');
   }
-  await requireAnswerEnabled(true);
-  const config = await requireApiConfig().catch(() => { throw new QuestionGenerationError('AI 配置不可用，请在设置页检查接口、模型和域名授权。'); });
+  await requireAnswerEnabled(true, options.feature);
+  const config = await requireApiConfig(Boolean(prepared.images.length)).catch(() => { throw new QuestionGenerationError('AI 配置不可用，请在设置页检查接口、模型和域名授权。'); });
   if (signal.aborted) throw new QuestionGenerationError('已取消答题。');
   await waitForProvider('ai', signal, onStatus);
   if (signal.aborted) throw new QuestionGenerationError('已取消答题。');
-  onStatus('正在请求 AI 答案…');
-  return generateQuestionAnswer(config, prepared, signal, onProgress);
+  onStatus(`正在请求 AI 答案 · ${config.model}…`);
+  return options.generateAi ? options.generateAi(config) : generateQuestionAnswer(config, prepared, signal, onProgress);
 }
 
 export async function resolveQuestionReview(
@@ -117,17 +137,18 @@ export async function resolveQuestionReview(
 ): ReturnType<typeof generateQuestionReview> {
   await requireAnswerEnabled(true);
   if (signal.aborted) throw new QuestionGenerationError('已取消整卷复检。');
-  const config = await requireApiConfig().catch(() => {
+  const config = await requireApiConfig(request.items.some(item => item.images.length > 0)).catch(() => {
     throw new QuestionGenerationError('AI 配置不可用，请在设置页检查接口、模型和域名授权。');
   });
   if (signal.aborted) throw new QuestionGenerationError('已取消整卷复检。');
   await waitForProvider('ai', signal, onStatus);
   if (signal.aborted) throw new QuestionGenerationError('已取消整卷复检。');
-  onStatus('正在请求 AI 整卷复检…');
+  onStatus(`步骤 2/3 · AI 整卷复检 · ${config.model}（本次仅一个请求）…`);
   return generateQuestionReview(config, request, signal, onProgress);
 }
 
 export function installQuestionGenerationBroker(): void {
+  onLocalBankChanged(() => { for (const abort of activeTabs.values()) abort.abort(); });
   chrome.tabs.onRemoved.addListener(tabId => { activeTabs.get(tabId)?.abort(); activeTabs.delete(tabId); });
   chrome.storage.onChanged.addListener((changes, area) => {
     if (area === 'local' && [SETTINGS_KEY, API_SETTINGS_KEY, QUESTION_BANK_SETTINGS_KEY, ANSWER_PREFERENCES_KEY, PACING_SETTINGS_KEY].some(key => changes[key])) {
@@ -138,7 +159,7 @@ export function installQuestionGenerationBroker(): void {
   chrome.runtime.onConnect.addListener(port => {
     if (port.name !== ANSWER_GENERATION_PORT) return;
     const sender = port.sender;
-    if (!sender || !isSupportedContent(sender, 'chaoxing') || sender.frameId !== 0 || sender.tab?.id === undefined) {
+    if (!sender || !isSupportedContent(sender) || sender.frameId !== 0 || sender.tab?.id === undefined) {
       port.disconnect(); return;
     }
     const tabId = sender.tab.id;
@@ -190,7 +211,7 @@ export function installQuestionGenerationBroker(): void {
       if (message.type !== 'generate' || started) return;
       started = true;
       if (!only(message, ['type', 'prepared', 'source']) || !validatePreparedQuestion(message.prepared)
-          || !['prefer-bank', 'bank', 'ai'].includes(String(message.source))) {
+          || !['prefer-bank', 'bank', 'ai', 'local'].includes(String(message.source))) {
         send({ type: 'error', error: '题目数据无效、图片不完整或超出大小限制，未请求题库或模型。' }); return;
       }
       const prepared = message.prepared;
@@ -199,8 +220,10 @@ export function installQuestionGenerationBroker(): void {
         try {
           if (activeTabs.has(tabId)) throw new QuestionGenerationError('当前标签页已有答题请求，请暂停后重试。');
           activeTabs.set(tabId, abort); heartbeat();
+          const stamp = await historyStamp(sender.url!).catch(() => undefined);
           const result = await resolveQuestionAnswer(prepared, source, abort.signal,
-            text => send({ type: 'progress', text }), text => send({ type: 'status', text }));
+            text => send({ type: 'progress', text }), text => send({ type: 'status', text }), bankCourseContext(sender.url));
+          if (!abort.signal.aborted && stamp) await rememberResult(sender.url!, prepared.question, result, stamp).catch(() => send({ type: 'status', text: '答案已获取，但历史记录保存失败；请在刷新前导出。' }));
           send({ type: 'result', result });
         } catch (error) {
           send({ type: 'error', error: generationErrorMessage(error) });

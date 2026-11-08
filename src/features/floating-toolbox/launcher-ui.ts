@@ -2,7 +2,7 @@ import { getApiStatus } from '../api-settings/client';
 import { openSettings } from '../../platform/settings-navigation';
 import { getPlatform, isSupportedUrl } from '../../shared/sites';
 import { isThinkLadderUrl } from '../ai-answer/adapters/think-ladder';
-import { isHomeworkUrl } from '../../platform/page-context';
+import { pageContextFromUrl, pageToolsTitle } from '../../platform/page-context';
 import { icon } from './icons';
 
 /** Compact launcher only. In-page feature workspaces own question and answer interaction. */
@@ -54,20 +54,22 @@ export function mountToolboxLauncher(root: HTMLElement): () => void {
       const platform = getPlatform(tab?.url);
       supported = Boolean(platform);
       const zjooc = platform?.id === 'zjooc';
-      apiSummary.hidden = zjooc;
+      const context = tab?.url ? pageContextFromUrl(tab.url) : 'generic';
+      const assessment = context === 'homework' || context === 'exam';
+      apiSummary.hidden = context === 'chapter' || zjooc && !assessment;
       const ladder = supported && tab?.url && isThinkLadderUrl(tab.url);
-      const homework = supported && tab?.url && isHomeworkUrl(tab.url);
       pageHint.textContent = supported
-        ? zjooc ? '浙学平台' : ladder ? '思维阶梯练习页' : homework ? '学习通作业页' : '学习通网页'
+        ? `${platform!.label} · ${pageToolsTitle(context)}`
         : '当前页面不支持';
       pageDetails.textContent = supported
-        ? zjooc ? '在课程学习详情页启用自动学习，视频使用平台最高倍速，并处理课件“完成学习”。'
+        ? assessment ? `${zjooc ? '浙学考试为候选适配。' : ''}在答题页识别当前已加载题目，选择来源后处理；填写后请自行检查并保存或交卷。`
+          : zjooc ? '在课程学习详情页启用自动学习，视频使用平台最高倍速，并处理课件“完成学习”。'
           : ladder ? '“答题”中生成并填入简答题回答；“思维阶梯”中粘贴、提取题目。'
-          : homework ? '在“作业”工作区允许粘贴、提取题目；AI 作答目前仅支持思维阶梯。'
+          : context === 'chapter' ? '章节学习中管理播放参数和测验联动；最小化后仍可暂停和继续。'
             : '可打开页面工具，使用允许粘贴与题目提取，题目以页面识别结果为准。'
         : '请切换到学习通（chaoxing.com）或浙学（www.zjooc.cn）页面。';
       panelNote.textContent = supported ? '' : '工具箱仅在已支持的网站内可用';
-      if (!zjooc) void inspectApi();
+      if (!apiSummary.hidden) void inspectApi();
     } catch {
       pageHint.textContent = '无法读取当前页面';
       pageDetails.textContent = '请关闭此窗口后重试。';

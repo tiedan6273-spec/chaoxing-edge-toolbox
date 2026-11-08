@@ -1,0 +1,15 @@
+.usage-gauge { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; padding: 12px; border: 2px solid var(--text-body, #29292e); border-radius: 10px; background: var(--surface-page, #fffdf5); color: var(--text-body, #29292e); }
+.usage-ring { position: relative; flex: 0 0 88px; width: 88px; height: 88px; }
+.usage-ring svg { width: 100%; height: 100%; overflow: visible; }
+.usage-ring circle { fill: none; stroke-width: 7; }
+.usage-ring-track { stroke: var(--border-inner, #deddd2); }
+.usage-ring-fill { stroke: #32896c; stroke-linecap: round; }
+.usage-ring-label { position: absolute; inset: 0; display: grid; place-items: center; font: inherit; font-size: 15px; font-weight: 700; line-height: 1.2; font-variant-numeric: tabular-nums; }
+.usage-ring-caption { flex: 1 1 130px; min-width: 0; font-size: 12px; line-height: 1.6; overflow-wrap: anywhere; }
+.usage-ring-caption p { margin: 3px 0; white-space: normal; }
+.usage-ring-caption small { font-size: 11px; opacity: .8; }
+.usage-gauge[data-state=warning] .usage-ring-fill { stroke: #a56409; }
+.usage-gauge[data-state=exceeded] .usage-ring-fill { stroke: #b33842; }
+.usage-gauge[data-state=unknown] .usage-ring-track { stroke-dasharray: 2 3; }
+.usage-gauge[data-state=unknown] .usage-ring-fill { stroke: #a56409; }
+.usage-gauge[data-state=unset] .usage-ring-fill, .usage-gauge[data-state=unavailable] .usage-ring-fill { stroke: transparent; }

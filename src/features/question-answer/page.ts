@@ -1,9 +1,10 @@
 import type { AnswerPageCommand, AnswerPageResult, ApplicableAnswer, QuestionIdentity } from './types';
-import { chapterAction, inspectQuestionPage, normalizeText, readQuestionControl, readSavedProgramCode, visible, type PageInspection, type QuestionEntry } from './adapters/chaoxing';
+import { chapterAction, inspectQuestionPage, normalizeText, readQuestionControl, readSavedProgramCode, visible, type PageInspection, type QuestionEntry } from './adapters';
 import { normalizeAnswer } from './normalize';
 import { prepareQuestionImages } from './images';
 import { prepareQuestionFont } from '../question-font';
 import { captureQuestionSnapshotMarkdown } from '../question-extract/snapshot';
+import { handlePaperFlow } from './flow-page';
 
 const operations = new WeakMap<Document, AbortController>();
 
@@ -60,9 +61,11 @@ async function write(win: Window, command: Extract<AnswerPageCommand, { action: 
     const value = readQuestionControl(win, live);
     if (live.root !== entry.root || !value.ready || value.version !== current.version) throw new Error('题目或答案在填写期间变化，已停止后续填写。');
   }
-  function mutate(action: () => void, expected: ApplicableAnswer): void {
+  async function mutate(action: () => void, expected: ApplicableAnswer): Promise<void> {
     guard();
     action();
+    // Framework-backed controls commit on the next turn. Pause can cancel here.
+    await new Promise<void>(resolve => win.setTimeout(resolve, 0));
     assertActive(signal);
     const live = locate(win, command).entry;
     const value = readQuestionControl(win, live);
@@ -76,7 +79,7 @@ async function write(win: Window, command: Extract<AnswerPageCommand, { action: 
       const wanted = answer.choices.includes(choice.option.id);
       if (selected === wanted || (!multiple && !wanted)) continue;
       const next = multiple ? entry.choices.filter(item => item.option.id === choice.option.id ? wanted : current.answer.choices?.includes(item.option.id)).map(item => item.option.id) : [choice.option.id];
-      mutate(() => choice.element.click(), { choices: next });
+      await mutate(() => choice.element.click(), { choices: next });
     }
   } else if (answer.texts) {
     for (let index = 0; index < entry.texts.length; index += 1) {
@@ -84,7 +87,7 @@ async function write(win: Window, command: Extract<AnswerPageCommand, { action: 
       if (current.answer.texts?.[index] === normalizeText(text)) continue;
       const field = entry.texts[index];
       const next = [...current.answer.texts!]; next[index] = normalizeText(text);
-      mutate(() => {
+      await mutate(() => {
         if (field.editor) {
           field.editor.fireEvent('savescene');
           field.editor.setContent(plainTextHtml(text), false);
@@ -108,7 +111,7 @@ async function write(win: Window, command: Extract<AnswerPageCommand, { action: 
       const option = field.options.find(item => item.option.id === answer.matches![index]);
       if (!option) throw new Error('连线答案不存在，已停止填写。');
       const next = [...current.answer.matches!]; next[index] = option.option.id;
-      mutate(() => {
+      await mutate(() => {
         if (field.element.tagName === 'SELECT') {
           const prototype = (win as Window & typeof globalThis).HTMLSelectElement.prototype;
           Object.getOwnPropertyDescriptor(prototype, 'value')!.set!.call(field.element, option.value);
@@ -124,14 +127,14 @@ async function write(win: Window, command: Extract<AnswerPageCommand, { action: 
       if (current.answer.children?.find(item => item.id === child.id)?.choices[0] === wanted) continue;
       const choice = child.choices.find(item => item.option.id === wanted)!;
       const next = current.answer.children!.map(item => item.id === child.id ? { id: child.id, choices: [wanted] } : item);
-      mutate(() => choice.element.click(), { children: next });
+      await mutate(() => choice.element.click(), { children: next });
     }
   } else if (answer.code !== undefined) {
     const code = answer.code;
     const editor = entry.program?.editor;
     if (!editor) throw new Error('编程编辑器未就绪，未写入代码。');
     if (code === entry.program?.template) throw new Error('生成的代码与页面初始模板相同，未写入；请重试本题。');
-    mutate(() => editor.setValue(code), { code });
+    await mutate(() => editor.setValue(code), { code });
   }
   guard();
   if (!sameAnswer(current.answer, answer) || !current.complete) throw new Error('答案回读不一致，未将该题标记为已填写。');
@@ -253,16 +256,18 @@ export async function handleAnswerPageCommand(win: Window, command: AnswerPageCo
     const abort = new AbortController();
     operations.set(win.document, abort);
     try {
+      if (command.action === 'flow') return await handlePaperFlow(win, command, abort.signal, () => inspectQuestionPage(win));
       if (command.action === 'write') return await write(win, command, abort.signal);
       if (command.action === 'finish') return await finish(win, command, abort.signal);
-      const { entry } = locate(win, command);
+      const { entry } = locate(win, command, true);
       const before = readQuestionControl(win, entry);
-      if (!before.ready) throw new Error(before.error || '当前题目不可处理。');
+      if (!entry.snapshot.supported) throw new Error(entry.snapshot.reason || '当前题目不可读取。');
       const timeout = win.setTimeout(() => abort.abort(), 15000);
       try {
         const prepared = await prepareQuestionImages(win, entry.root, entry.snapshot, abort.signal);
+        prepared.question = { ...prepared.question }; delete prepared.question.reviewData;
         assertActive(abort.signal);
-        const after = locate(win, command).entry;
+        const after = locate(win, command, true).entry;
         if (after.root !== entry.root || readQuestionControl(win, after).version !== before.version) throw new Error('图片读取期间题目或答案已变化，请重试。');
         return { ok: true, prepared };
       } finally { win.clearTimeout(timeout); }

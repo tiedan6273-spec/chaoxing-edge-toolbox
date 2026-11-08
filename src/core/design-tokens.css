@@ -1,38 +1,39 @@
 /*
- * 共享设计令牌：popup 与 options 两类扩展页面的单一来源。
- * 取值镜像 src/features/floating-toolbox/styles.ts（悬浮框为视觉基准），
- * 修改任一侧时需同步另一侧，保持一致的设计语言。
+ * 漫画风共享令牌。popup/options 通过 CSS 引入，悬浮框以文本导入同一文件。
  */
 :root {
   color-scheme: light;
 
   /* 品牌色（teal） */
-  --primary: #0f766e;
-  --primary-hover: #115e59;
-  --focus-ring: #0d9488;
+  --primary: #3e68e8;
+  --primary-hover: #284fc4;
+  --focus-ring: #244bc3;
   --text-on-primary: #fff;
 
   /* 选中/悬停底色（teal tint） */
-  --tint-bg: #f0fdfa;
-  --tint-bg-strong: #ccfbf1;
-  --tint-border: #99f6e4;
-  --tint-border-strong: #5eead4;
+  --tint-bg: #edf1ff;
+  --tint-bg-strong: #dce5ff;
+  --tint-border: #8c9fd6;
+  --tint-border-strong: #3e68e8;
+  --comic-yellow: #ffd84d;
+  --comic-mint: #a9dfc7;
+  --comic-ink: #202127;
 
   /* 表面（slate） */
-  --surface-page: #f8fafc;
-  --surface-muted: #f1f5f9;
-  --surface: #fff;
+  --surface-page: #f5f2e8;
+  --surface-muted: #ebe9e1;
+  --surface: #fffdf5;
 
   /* 边框（slate） */
-  --border: #cbd5e1;
-  --border-inner: #e2e8f0;
-  --border-strong: #94a3b8;
+  --border: #202127;
+  --border-inner: #d5d3c9;
+  --border-strong: #202127;
 
   /* 文字（slate） */
-  --text-primary: #0f172a;
-  --text-title: #334155;
-  --text-body: #475569;
-  --text-muted: #64748b;
+  --text-primary: #202127;
+  --text-title: #202127;
+  --text-body: #34363e;
+  --text-muted: #60626a;
 
   /* 警示与错误 */
   --warning-bg: #fffbeb;
@@ -43,11 +44,11 @@
   --error-border: #fecaca;
 
   /* 圆角阶：小控件 / 表单与内容卡片 / 外层面板。 */
-  --radius-sm: 6px;
+  --radius-sm: 5px;
   --radius-md: 8px;
   --radius-lg: 10px;
-  --shadow-card: 0 1px 3px #0f172a06;
-  --shadow-panel: 0 12px 32px #0f172a1a, 0 2px 6px #0f172a0a;
+  --shadow-card: 2px 2px 0 #202127;
+  --shadow-panel: 4px 4px 0 #202127;
 
   /* 控件尺度（与悬浮框一致） */
   --control-height: 36px;

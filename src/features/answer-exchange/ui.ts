@@ -3,12 +3,14 @@ import type { ApplicableAnswer, QuestionAnswerController, QuestionAnswerState, Q
 import { isFeatureEnabled, type Settings } from '../toolbox-settings/types';
 import { clearLocalBank, readLocalBank, saveLocalBank } from '../local-question-bank/client';
 import { matchLocalBank } from '../local-question-bank/matching';
+import { subscribeLibraries } from '../local-question-bank/library-client';
 import { canExportQuestion, createAnswerBatch, parseExchangePack, resolveAnswerPack } from './protocol';
 import { buildAnswerPrompt, buildBankPrompt } from './prompt';
 import type { AnswerBatch, BankEntry } from './types';
 
 interface Dependencies {
   controller: QuestionAnswerController;
+  subscribeBank?(listener: () => void): () => void;
   bank?: {
     read(): Promise<BankEntry[]>;
     save(entries: BankEntry[]): Promise<{ added: number; total: number }>;
@@ -393,6 +395,15 @@ export function createAnswerExchangeView(dependencies: Dependencies): WorkspaceV
     state = next;
     render();
   });
+  const onBankChanged = () => {
+    count = undefined;
+    if (pending?.source === 'local-bank' || (busy && !pending)) {
+      ++revision; busy = false; resetPreview();
+      tell('本地题库已更改，已取消旧匹配预览，请重新匹配。');
+    }
+    render();
+  };
+  const unsubscribeBank = dependencies.subscribeBank ? dependencies.subscribeBank(onBankChanged) : dependencies.bank ? () => {} : subscribeLibraries(onBankChanged);
   render();
   return {
     element: root,
@@ -411,6 +422,6 @@ export function createAnswerExchangeView(dependencies: Dependencies): WorkspaceV
       }
       render();
     },
-    dispose() { disposed = true; ++revision; unsubscribe(); listeners.abort(); batch = undefined; pending = undefined; root.remove(); },
+    dispose() { disposed = true; ++revision; unsubscribe(); unsubscribeBank(); listeners.abort(); batch = undefined; pending = undefined; root.remove(); },
   };
 }

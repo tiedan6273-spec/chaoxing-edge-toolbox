@@ -1,8 +1,9 @@
 import type { ApiConfig } from './types';
+import { readUsage, type TokenUsage } from '../activity/types';
 
 export type ChatContentPart = { type: 'text'; text: string } | { type: 'image_url'; image_url: { url: string } };
 export interface ChatMessage { role: 'system' | 'user'; content: string | ChatContentPart[] }
-export interface ChatCompletionOptions { totalTimeoutMs?: number }
+export interface ChatCompletionOptions { totalTimeoutMs?: number; onUsage?(usage: TokenUsage): void }
 
 export class ModelRequestError extends Error {
   constructor(public readonly code: string, message: string) { super(message); this.name = 'ModelRequestError'; }
@@ -52,6 +53,7 @@ export async function requestChatCompletion(
   // Extension service workers cannot wait indefinitely for response headers.
   const headerTimer = setTimeout(() => { timedOut = true; abort.abort(); }, 25000);
   let receivedResponse = false;
+  let usage: TokenUsage | undefined;
   try {
     const response = await fetch(config.endpoint, {
       method: 'POST',
@@ -60,7 +62,8 @@ export async function requestChatCompletion(
         Accept: config.stream ? 'text/event-stream, application/json' : 'application/json',
         Authorization: `Bearer ${config.apiKey}`,
       },
-      body: JSON.stringify({ model: config.model, messages, stream: config.stream }),
+      body: JSON.stringify({ model: config.model, messages, stream: config.stream,
+        ...(config.stream && new URL(config.endpoint).hostname === 'api.deepseek.com' ? { stream_options: { include_usage: true } } : {}) }),
       signal: abort.signal,
       credentials: 'omit',
       cache: 'no-store',
@@ -76,6 +79,7 @@ export async function requestChatCompletion(
     const contentType = (response.headers.get('content-type') ?? '').toLowerCase();
     if (!contentType.includes('text/event-stream')) {
       const result = await response.json();
+      usage = readUsage(result?.usage);
       const choice = result?.choices?.[0];
       if (result?.error || !choice) throw new ModelRequestError('format', '接口未返回兼容的 Chat Completions 响应。');
       const answer = ensureComplete(textContent(choice.message?.content), choice.finish_reason);
@@ -97,6 +101,7 @@ export async function requestChatCompletion(
       try { chunk = JSON.parse(data); } catch { throw new ModelRequestError('format', '响应流格式不兼容，未自动填入。'); }
       if (!chunk || typeof chunk !== 'object') throw new ModelRequestError('format', '响应流未返回兼容的 Chat Completions 数据。');
       if (chunk.error) throw new ModelRequestError('server', '模型服务中断了生成，请手动重试。');
+      usage = readUsage(chunk.usage) ?? usage;
       const choice = chunk.choices?.[0];
       if (!choice) return;
       // Only final answer content is collected; provider reasoning fields are never used.
@@ -144,5 +149,6 @@ export async function requestChatCompletion(
     clearTimeout(totalTimer);
     clearTimeout(headerTimer);
     signal.removeEventListener('abort', cancel);
+    if (usage) options.onUsage?.(usage);
   }
 }

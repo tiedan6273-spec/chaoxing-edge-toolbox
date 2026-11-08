@@ -16,6 +16,8 @@ import { answerSourceRoutes, subscribeStoredAnswerSource } from '../features/que
 import { configBackupRoutes } from '../features/config-backup/background';
 import { pacingRoutes, subscribeStoredPacing } from '../features/answer-pacing/background';
 import { localQuestionBankRoutes } from '../features/local-question-bank/background';
+import { activityRoutes } from '../features/activity/background';
+import { paperFlowRoutes } from '../features/question-answer/flow-background';
 
 async function showSettings(section: unknown): Promise<void> {
   const view = section === 'api' || section === 'floating' || section === 'question-bank' ? section : 'features';
@@ -33,6 +35,8 @@ const routes: BackgroundRoutes = {
   ...apiSettingsRoutes,
   ...questionBankRoutes,
   ...localQuestionBankRoutes,
+  ...activityRoutes,
+  ...paperFlowRoutes,
   ...configBackupRoutes,
   ...pacingRoutes,
   ...answerSourceRoutes,

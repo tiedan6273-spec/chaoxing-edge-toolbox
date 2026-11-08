@@ -1,10 +1,13 @@
 import { isThinkLadderUrl } from '../features/ai-answer/adapters/think-ladder';
 import { isChapterStudyUrl } from '../features/chapter-study/adapters/chapter';
-import { isPlatformUrl } from '../shared/sites';
+import { getPlatform } from '../shared/sites';
+import { assessmentSceneFromUrl } from './assessment-routes';
+import { readZjoocRoute } from '../features/zjooc-study/adapters/page';
+import { isZjoocReviewDocument } from './zjooc-review';
 
 export type PageContext = 'chapter' | 'homework' | 'exam' | 'think-ladder' | 'generic';
 
-const PAGE_MARKERS = '#coursetree, #fanyaMarking, #submitForm, #realApp, #chatScroll, .questionLi, input[name="workAnswerId"], iframe';
+const PAGE_MARKERS = '#coursetree, #fanyaMarking, #submitForm, #realApp, #chatScroll, .questionLi, .question-item, .questiono-item, .subject-item, [data-question-id], input[name="workAnswerId"], iframe';
 const PAGE_IDS = new Set(['coursetree', 'fanyaMarking', 'submitForm', 'realApp', 'chatScroll']);
 
 function isEditorContent(element: Element): boolean {
@@ -37,20 +40,15 @@ function changesPageStructure(record: MutationRecord): boolean {
 }
 
 export function isHomeworkUrl(value: string): boolean {
-  if (!isPlatformUrl(value, 'chaoxing')) return false;
-  try {
-    return /^\/(?:mooc-ans\/)?(?:mooc2\/)?work(?:\/|$)/i.test(new URL(value).pathname);
-  } catch { return false; }
+  return assessmentSceneFromUrl(value) === 'homework';
 }
 
 export function isExamUrl(value: string): boolean {
-  if (!isPlatformUrl(value, 'chaoxing')) return false;
-  try { return /^\/(?:mooc-ans\/)?(?:mooc2\/)?exam(?:\/|$)/i.test(new URL(value).pathname); }
-  catch { return false; }
+  return assessmentSceneFromUrl(value) === 'exam';
 }
 
 export function pageContextFromUrl(value: string): PageContext {
-  if (isChapterStudyUrl(value)) return 'chapter';
+  if (isChapterStudyUrl(value) || readZjoocRoute(value)) return 'chapter';
   if (isThinkLadderUrl(value)) return 'think-ladder';
   if (isExamUrl(value)) return 'exam';
   if (isHomeworkUrl(value)) return 'homework';
@@ -64,8 +62,10 @@ export function readPageContext(doc: Document): PageContext {
     if (visited.has(current) || depth > 3) return 'generic';
     visited.add(current);
     const href = current.location?.href ?? current.URL;
+    if (getPlatform(href)?.id === 'zjooc' && isZjoocReviewDocument(current)) return 'exam';
     const route = pageContextFromUrl(href);
     if (route !== 'generic') return route;
+    if (getPlatform(href)?.id === 'zjooc') return 'generic';
     // The chapter shell owns embedded work routes, including its chapter quiz.
     if (current.querySelector('#coursetree') && current.querySelector('iframe#iframe')) return 'chapter';
     const workForm = current.querySelector<HTMLFormElement>('form#submitForm');
@@ -102,6 +102,7 @@ export function pageToolsTitle(context: PageContext): string {
 export function observePageContext(doc: Document, changed: (context: PageContext) => void): () => void {
   const observers = new Map<Document, MutationObserver>();
   let context = readPageContext(doc);
+  let href = doc.location?.href;
   let timer: ReturnType<typeof setTimeout> | undefined;
   let disposed = false;
   const schedule = () => {
@@ -143,9 +144,15 @@ export function observePageContext(doc: Document, changed: (context: PageContext
     }
   }
   watchDocuments();
+  // SPA navigation can change the URL without inserting a known page marker.
+  const routeMonitor = setInterval(() => {
+    const next = doc.location?.href;
+    if (next !== href) { href = next; schedule(); }
+  }, 500);
   return () => {
     disposed = true;
     if (timer !== undefined) clearTimeout(timer);
+    clearInterval(routeMonitor);
     for (const [current, observer] of observers) {
       observer.disconnect();
       current.removeEventListener('load', onLoad, true);

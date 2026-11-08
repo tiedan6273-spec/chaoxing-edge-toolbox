@@ -24,6 +24,8 @@ import { answerExchangeStyles } from './answer-exchange/styles';
 
 export interface WorkspaceView {
   element: HTMLElement;
+  /** Optional controls owned by the view, mounted in the shell's fixed action row. */
+  actions?: HTMLElement;
   update(settings: Settings | undefined, saving: boolean): void;
   refresh?(): void;
   updatePage?(context: PageContext): void;
@@ -66,7 +68,8 @@ export const WORKSPACES: ReadonlyArray<{
     if (!context.study) throw new Error('Missing Chaoxing study controller');
     return createChapterStudyView({ ...context, study: context.study });
   } },
-  { id: 'zjooc-study', platform: 'zjooc', title: '章节学习', icon: 'study', create: createZjoocStudyView },
+  { id: 'zjooc-study', platform: 'zjooc', title: '章节学习', icon: 'study', visibleOnPage: scene => scene !== 'exam' && scene !== 'homework', create: createZjoocStudyView },
+  { id: 'zjooc-exam', platform: 'zjooc', title: '考试', titleOnPage: pageToolsTitle, icon: 'extract', visibleOnPage: scene => scene === 'exam' || scene === 'homework', create: createPageToolsView },
 ];
 
 export function getWorkspaces(platformId?: PlatformId, context?: PageContext): typeof WORKSPACES {

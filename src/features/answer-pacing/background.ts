@@ -37,7 +37,7 @@ export async function waitForProvider(source: Provider, signal: AbortSignal, onW
 }
 
 export const pacingRoutes: BackgroundRoutes = {
-  'toolbox:answer-pacing:read': { access: 'public', platforms: ['chaoxing'], handle: readStoredPacing },
+  'toolbox:answer-pacing:read': { access: 'public', platforms: ['chaoxing', 'zjooc'], handle: readStoredPacing },
   'toolbox:answer-pacing:save': { access: 'options', handle: async message => {
     validateAnswerPacing(message.preferences);
     await privateStorageReady;
@@ -47,6 +47,6 @@ export const pacingRoutes: BackgroundRoutes = {
 
 export function subscribeStoredPacing(): void {
   chrome.storage.onChanged.addListener((changes, area) => {
-    if (area === 'local' && changes[PACING_SETTINGS_KEY]) void broadcastPublic({ type: 'toolbox:answer-pacing:changed' }, ['chaoxing']);
+    if (area === 'local' && changes[PACING_SETTINGS_KEY]) void broadcastPublic({ type: 'toolbox:answer-pacing:changed' }, ['chaoxing', 'zjooc']);
   });
 }

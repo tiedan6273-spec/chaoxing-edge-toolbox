@@ -1,5 +1,7 @@
 import { isFeatureId, type FeatureId } from '../features/catalog';
 import type { Settings } from './settings';
+import { normalizeZjoocPlaybackRate } from '../features/zjooc-study/playback-rate';
+import { normalizeZjoocStartMode } from '../features/zjooc-study/start-position';
 import type { AnswerSnapshot, AnswerWriteRequest, AnswerWriteResult, CurrentQuestion } from '../features/ai-answer/types';
 import type { StudyPageRequest, StudyPageResult, StudyTaskProgress } from '../features/chapter-study/types';
 import { isStudyPageRequest, isStudyPageResult, isStudyProgress } from '../features/chapter-study/protocol';
@@ -105,6 +107,8 @@ export function parseBridgeData(data: unknown): BridgeMessage | null {
     }
     return { channel: CHANNEL, kind: 'apply', revision: value.revision as number, settings: {
       version: 1, enabled: settings.enabled, features: features as Settings['features'],
+      zjoocPlaybackRate: normalizeZjoocPlaybackRate(settings.zjoocPlaybackRate),
+      zjoocStartMode: normalizeZjoocStartMode(settings.zjoocStartMode),
     } };
   }
   if (value.kind === 'applied' && Array.isArray(value.activeFeatures) && value.activeFeatures.every(isFeatureId)

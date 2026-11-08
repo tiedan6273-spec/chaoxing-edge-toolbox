@@ -20,7 +20,7 @@ export const FEATURES = [
   },
   {
     id: 'ai-answer',
-    supportedPlatforms: ['chaoxing'],
+    supportedPlatforms: ['chaoxing', 'zjooc'],
     title: 'AI 作答',
     description: '为批量答题和思维阶梯提供模型回答，思维阶梯由你手动发送。',
     category: '学习辅助',
@@ -28,7 +28,7 @@ export const FEATURES = [
   },
   {
     id: 'question-answer',
-    supportedPlatforms: ['chaoxing'],
+    supportedPlatforms: ['chaoxing', 'zjooc'],
     title: '题库与 AI 答题',
     description: '逐题获取并核对答案，支持言溪题库、AI 和章节测验联动。',
     category: '学习辅助',
@@ -46,7 +46,7 @@ export const FEATURES = [
     id: 'zjooc-study',
     supportedPlatforms: ['zjooc'],
     title: '浙学自动学习',
-    description: '按目录自动播放视频并选择平台最高倍速，确认课件学习。',
+    description: '按目录自动播放视频，支持选择平台倍速并确认课件学习。',
     category: '学习辅助',
     defaultEnabled: false,
   },

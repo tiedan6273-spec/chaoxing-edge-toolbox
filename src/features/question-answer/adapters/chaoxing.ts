@@ -1,6 +1,7 @@
 import type { ApplicableAnswer, AnswerControlSnapshot, QuestionKind, QuestionOption, QuestionPageSnapshot, QuestionSnapshot } from '../types';
 import { readQuestionTextDetails, type QuestionTextRead } from '../../question-font';
 import { normalizeProgramCode } from '../normalize';
+import { assessmentSceneFromUrl } from '../../../platform/assessment-routes';
 
 export interface AnswerEditor {
   isReady?: boolean | number; iframe?: HTMLIFrameElement; body?: HTMLElement; container?: HTMLElement;
@@ -16,7 +17,7 @@ export interface ProgramControl {
 }
 export interface QuestionEntry {
   root: HTMLElement; snapshot: QuestionSnapshot; sourceId: string; choices: ChoiceControl[];
-  texts: TextControl[]; matches: MatchControl[]; children: ChildControl[]; program?: ProgramControl;
+  texts: TextControl[]; matches: MatchControl[]; children: ChildControl[]; program?: ProgramControl; readOnly?: boolean;
 }
 export interface PageInspection { snapshot: QuestionPageSnapshot; entries: QuestionEntry[] }
 
@@ -57,7 +58,7 @@ export function imageAddress(image: Element): string | undefined {
 
 /** Only question-owned content is read; answer/editing areas are deliberately omitted. */
 type TextReads = Map<Node, QuestionTextRead & { original: string }>;
-function questionText(element: Element, images: string[], omitChoices = false, reads?: TextReads): string {
+export function questionText(element: Element, images: string[], omitChoices = false, reads?: TextReads): string {
   function walk(node: Node): string {
     if (node.nodeType === 3) {
       const result = readQuestionTextDetails(node);
@@ -380,8 +381,7 @@ export function inspectQuestionPage(win: Window): PageInspection {
   const allowed = /(^|\.)chaoxing\.com$/.test(url.hostname) && ['http:', 'https:'].includes(url.protocol);
   const chapter = Boolean(doc.querySelector('.TiMu')) && (Boolean(doc.querySelector('.testTit_status')) || ['jobid', '_jobid', 'knowledgeid', 'knowledgeId'].some(key => url.searchParams.has(key)));
   const scene: QuestionPageSnapshot['scene'] = !allowed || !isPageVisible(win) ? 'unsupported'
-    : chapter ? 'chapter-test' : /\/(?:mooc2\/)?exam(?:\/|$)/i.test(url.pathname) ? 'exam'
-      : /\/(?:mooc2\/)?work(?:\/|$)/i.test(url.pathname) ? 'homework' : 'unsupported';
+    : chapter ? 'chapter-test' : assessmentSceneFromUrl(url.href) ?? 'unsupported';
   const identityValues = Array.from(doc.querySelectorAll<HTMLInputElement>('input[name=workAnswerId],input[name=workId],input[name=examId],input[name=paperId],input[name=jobid],#workId,#workAnswerId,#paperId')).map(node => [node.name || node.id, node.value]);
   const scopeKey = signature(JSON.stringify([url.href, identityValues, doc.querySelector<HTMLFormElement>('form#submitForm,form#form1')?.getAttribute('action') ?? '']));
   const roots = scene === 'unsupported' ? [] : Array.from(doc.querySelectorAll<HTMLElement>(chapter ? '.TiMu' : '.questionLi'))
@@ -414,7 +414,7 @@ export function inspectQuestionPage(win: Window): PageInspection {
 function choiceSelected(choice: ChoiceControl): boolean {
   if (choice.input) return choice.input.checked;
   return [choice.element, choice.state, choice.element.parentElement].some(element => element?.getAttribute('aria-checked') === 'true'
-    || Array.from(element?.classList ?? []).some(name => name.startsWith('check_answer'))
+    || Array.from(element?.classList ?? []).some(name => name.startsWith('check_answer') || name === 'is-checked')
     || Boolean(element?.querySelector('[class*="check_answer"]')));
 }
 function richText(doc: Document, html: string): { text: string; hasMedia: boolean } {
@@ -443,6 +443,9 @@ export function readQuestionControl(win: Window, entry: QuestionEntry): AnswerCo
   const programTemplate = question.kind === 'program' ? entry.program?.template ?? '' : '';
   const programTemplateOnly = Boolean(programCode) && !programSaved && programCode === programTemplate;
   if (['single', 'multiple', 'judgement'].includes(question.kind)) { answer.choices = entry.choices.filter(choiceSelected).map(item => item.option.id); hasContent = answer.choices.length > 0; }
+  if (entry.readOnly && question.reviewData?.answer.choices?.length && !hasContent) {
+    answer.choices = [...question.reviewData.answer.choices]; hasContent = true;
+  }
   if (question.kind === 'program') {
     // A page-provided skeleton is not an answer; a saved draft is.
     answer.code = programTemplateOnly ? '' : programCode || programSaved;
@@ -456,7 +459,7 @@ export function readQuestionControl(win: Window, entry: QuestionEntry): AnswerCo
   }
   if (question.kind === 'line') { answer.matches = entry.matches.map(item => item.options.find(option => option.value === item.element.value)?.option.id ?? ''); hasContent = answer.matches.some(Boolean); }
   if (question.kind === 'reader' || question.kind === 'fill') { answer.children = entry.children.map(child => ({ id: child.id, choices: child.choices.filter(choiceSelected).map(item => item.option.id) })); hasContent = answer.children.some(child => child.choices.length > 0); }
-  const blocked = pageComplete(win.document) || disabled(entry.root) || !visible(entry.root) || !entry.root.isConnected
+  const blocked = Boolean(entry.readOnly) || pageComplete(win.document) || disabled(entry.root) || !visible(entry.root) || !entry.root.isConnected
     || entry.choices.some(choice => disabled(choice.input ?? choice.element))
     || entry.texts.some(item => item.waiting || disabled(item.element) || Boolean(item.editor?.body && disabled(item.editor.body)))
     || entry.matches.some(item => disabled(item.element)) || entry.children.some(child => child.choices.some(choice => disabled(choice.input ?? choice.element)))

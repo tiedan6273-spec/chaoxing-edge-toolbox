@@ -16,6 +16,48 @@ export interface ApiStatus {
   model: string;
   supportsImages?: boolean;
   message: string;
+  profileName?: string;
+  enabledCount?: number;
+}
+
+export interface ApiProfile { id: string; name: string; priority: number; enabled: boolean; config: ApiConfig }
+export interface ApiSettings { version: 2; profiles: ApiProfile[] }
+export const MAX_API_PROFILES = 10;
+export const emptyApiSettings = (): ApiSettings => ({ version: 2, profiles: [] });
+
+/** Reading a legacy single model is lossless and does not overwrite storage. */
+export function normalizeApiSettings(value: unknown): ApiSettings {
+  if (value && typeof value === 'object' && (value as ApiSettings).version === 2) {
+    validateApiSettings(value);
+    return { version: 2, profiles: (value as ApiSettings).profiles.map(p => ({ id: p.id, name: p.name.trim(), priority: p.priority, enabled: p.enabled, config: normalizeApiConfig(p.config) })) };
+  }
+  const config = normalizeApiConfig(value);
+  return { version: 2, profiles: config.endpoint || config.apiKey || config.model
+    ? [{ id: 'legacy', name: '原有模型', priority: 1, enabled: true, config }] : [] };
+}
+
+export function validateApiSettings(value: unknown): asserts value is ApiSettings {
+  const v = value as ApiSettings | undefined;
+  if (!v || v.version !== 2 || !Array.isArray(v.profiles) || v.profiles.length > MAX_API_PROFILES) throw new Error('模型列表无效，最多保存 10 个模型。');
+  const ids = new Set<string>();
+  for (const p of v.profiles) {
+    if (!p || typeof p.id !== 'string' || !/^[\w-]{1,80}$/.test(p.id) || ids.has(p.id)
+      || typeof p.name !== 'string' || !p.name.trim() || p.name.length > 80
+      || !Number.isInteger(p.priority) || p.priority < 1 || p.priority > 999 || typeof p.enabled !== 'boolean'
+      || !p.config || p.config.version !== 1 || typeof p.config.stream !== 'boolean'
+      || typeof p.config.endpoint !== 'string' || typeof p.config.apiKey !== 'string' || typeof p.config.model !== 'string'
+      || (p.config.supportsImages !== undefined && typeof p.config.supportsImages !== 'boolean')) throw new Error('模型名称、优先级或配置无效。');
+    ids.add(p.id); validateApiConfig(normalizeApiConfig(p.config));
+  }
+}
+
+export function rankedProfiles(settings: ApiSettings, images = false): ApiProfile[] {
+  return settings.profiles.filter(p => p.enabled && (!images || p.config.supportsImages))
+    .sort((a, b) => a.priority - b.priority || settings.profiles.indexOf(a) - settings.profiles.indexOf(b));
+}
+
+export function apiSettingsOrigins(settings: ApiSettings): string[] {
+  return [...new Set(settings.profiles.map(p => apiOrigin(p.config.endpoint)))];
 }
 
 export function emptyApiConfig(): ApiConfig {

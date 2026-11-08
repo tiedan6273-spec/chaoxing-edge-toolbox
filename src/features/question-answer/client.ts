@@ -6,6 +6,7 @@ import { isAnswerPageCommand, isAnswerPageResult } from './protocol';
 import { canUseQuestionAnswerOperation } from './permissions';
 import { observeQuestionStructure } from './structure';
 import { isQuestionReviewResult, type QuestionReviewRequest, type QuestionReviewResult } from './review';
+import type { LocalAnswerProof } from '../local-question-bank/library-types';
 import {
   ANSWER_FRAME_PORT, ANSWER_GENERATION_PORT, type AnswerPageCommand, type AnswerPageResult,
   type AnswerResult, type AnswerSourceMode, type AnswerSourcesStatus, type PreparedQuestion, type QuestionTarget,
@@ -24,7 +25,7 @@ export function subscribeAnswerSource(listener: () => void): () => void {
 
 export interface AnswerRuntime {
   scan(signal: AbortSignal): Promise<AnswerFrameSnapshot[]>;
-  page(target: Pick<QuestionTarget, 'frameId' | 'documentId'>, command: AnswerPageCommand, signal: AbortSignal): Promise<AnswerPageResult>;
+  page(target: Pick<QuestionTarget, 'frameId' | 'documentId'>, command: AnswerPageCommand, signal: AbortSignal, localProof?: LocalAnswerProof): Promise<AnswerPageResult>;
   cancel(): void;
   subscribeInvalidation?(listener: () => void): () => void;
 }
@@ -128,11 +129,11 @@ export function createQuestionAnswerClient(bridge: PageBridge, getSettings: () =
       if (!canUseQuestionAnswerOperation(getSettings(), 'scan')) throw new Error('请先开启题目提取或批量答题。');
       return await call('scan', {}, signal) as AnswerFrameSnapshot[];
     },
-    page: async (target, command, signal) => {
+    page: async (target, command, signal, localProof) => {
       if (!canUseQuestionAnswerOperation(getSettings(), command.action)) {
         throw new Error(command.action === 'inspect' || command.action === 'read' ? '请先开启题目提取或批量答题。' : '批量答题已关闭。');
       }
-      const result = await call('page', { frameId: target.frameId, documentId: target.documentId, command }, signal);
+      const result = await call('page', { frameId: target.frameId, documentId: target.documentId, command, ...(localProof ? { localProof } : {}) }, signal);
       if (!isAnswerPageResult(result)) throw new Error('答题页面返回了无效结果。');
       if (!result.ok) throw new Error(result.error || '题目页面操作失败。');
       return result;
@@ -184,6 +185,7 @@ export function generateQuestionAnswer(prepared: PreparedQuestion, source: Answe
     prepared: { ...prepared, question: (() => {
       const question = { ...prepared.question };
       delete question.markdown;
+      delete question.reviewData;
       return question;
     })() },
     source,

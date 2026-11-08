@@ -1,13 +1,14 @@
-import { apiOrigin, normalizeApiConfig, validateApiConfig, type ApiConfig } from '../api-settings/types';
+import { apiOrigin, apiSettingsOrigins, normalizeApiConfig, validateApiConfig, normalizeApiSettings, validateApiSettings, type ApiConfig, type ApiSettings } from '../api-settings/types';
 import { QUESTION_BANK_ORIGIN, normalizeQuestionBankConfig, validateQuestionBankConfig, type QuestionBankConfig } from '../question-bank/types';
 
 export const BACKUP_FORMAT = 'chaoxing-edge-toolbox-config';
-export const BACKUP_MAX_BYTES = 65536;
+export const BACKUP_MAX_BYTES = 131072;
 export interface ConfigBackup {
   format: typeof BACKUP_FORMAT;
-  version: 1;
+  version: 1 | 2;
   exportedAt: string;
   api?: ApiConfig;
+  apiProfiles?: ApiSettings;
   questionBank?: QuestionBankConfig;
 }
 
@@ -17,10 +18,14 @@ const invalid = () => new Error('备份格式或配置无效，请选择本插�
 
 /** Validate before normalization: malformed credentials must never become empty/default config. */
 export function validateConfigBackup(value: unknown): ConfigBackup {
-  if (!object(value) || value.format !== BACKUP_FORMAT || value.version !== 1
-      || !only(value, ['format', 'version', 'exportedAt', 'api', 'questionBank'])
+  if (!object(value) || value.format !== BACKUP_FORMAT || (value.version !== 1 && value.version !== 2)
+      || !only(value, ['format', 'version', 'exportedAt', 'api', 'apiProfiles', 'questionBank'])
       || typeof value.exportedAt !== 'string' || value.exportedAt.length > 40 || !Number.isFinite(Date.parse(value.exportedAt))) throw invalid();
-  const backup: ConfigBackup = { format: BACKUP_FORMAT, version: 1, exportedAt: value.exportedAt };
+  const backup: ConfigBackup = { format: BACKUP_FORMAT, version: value.version as 1 | 2, exportedAt: value.exportedAt };
+  if (Object.hasOwn(value, 'apiProfiles')) {
+    if (value.version !== 2 || Object.hasOwn(value, 'api')) throw invalid();
+    try { validateApiSettings(value.apiProfiles); backup.apiProfiles = normalizeApiSettings(value.apiProfiles); } catch { throw invalid(); }
+  }
   if (Object.hasOwn(value, 'api')) {
     const api = value.api;
     if (!object(api) || api.version !== 1 || !only(api, ['version', 'endpoint', 'apiKey', 'model', 'stream', 'supportsImages'])
@@ -35,7 +40,7 @@ export function validateConfigBackup(value: unknown): ConfigBackup {
     backup.questionBank = normalizeQuestionBankConfig(bank);
     try { validateQuestionBankConfig(backup.questionBank); } catch { throw invalid(); }
   }
-  if (!backup.api && !backup.questionBank) throw new Error('备份未包含可恢复的 API 或言溪题库配置。');
+  if (!backup.api && !backup.apiProfiles?.profiles.length && !backup.questionBank) throw new Error('备份未包含可恢复的 API 或言溪题库配置。');
   return backup;
 }
 
@@ -47,5 +52,5 @@ export function parseConfigBackup(text: string): ConfigBackup {
 }
 
 export function backupOrigins(backup: ConfigBackup): string[] {
-  return [...new Set([...(backup.api ? [apiOrigin(backup.api.endpoint)] : []), ...(backup.questionBank ? [QUESTION_BANK_ORIGIN] : [])])];
+  return [...new Set([...(backup.api ? [apiOrigin(backup.api.endpoint)] : []), ...(backup.apiProfiles ? apiSettingsOrigins(backup.apiProfiles) : []), ...(backup.questionBank ? [QUESTION_BANK_ORIGIN] : [])])];
 }

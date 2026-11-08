@@ -2,7 +2,8 @@
 export function observeQuestionStructure(doc: Document, changed: () => void): () => void {
   const win = doc.defaultView;
   if (!win) return () => {};
-  const selector = '.TiMu,.questionLi,form#form1,form#submitForm,iframe';
+  const selector = '.TiMu,.questionLi,.question-item,.questiono-item,.subject-item,.exam-question,[data-question-id],form#form1,form#submitForm,iframe';
+  let href = doc.URL;
   let timer: ReturnType<typeof setTimeout> | undefined;
   function excluded(element: Element): boolean {
     return Boolean(element.closest('[data-cx-toolbox],#cx-toolbox-root,.edui-editor,.edui-editor-iframeholder'))
@@ -31,5 +32,6 @@ export function observeQuestionStructure(doc: Document, changed: () => void): ()
     if (target?.nodeType === 1 && (target as Element).tagName === 'IFRAME' && !excluded(target as Element)) schedule();
   };
   doc.addEventListener('load', loaded, true);
-  return () => { observer.disconnect(); doc.removeEventListener('load', loaded, true); clearTimeout(timer); };
+  const routeMonitor = setInterval(() => { if (href !== doc.URL) { href = doc.URL; schedule(); } }, 500);
+  return () => { observer.disconnect(); doc.removeEventListener('load', loaded, true); clearTimeout(timer); clearInterval(routeMonitor); };
 }

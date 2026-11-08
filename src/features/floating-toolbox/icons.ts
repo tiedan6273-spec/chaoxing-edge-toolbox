@@ -7,6 +7,9 @@ const paths = {
   settings: '<path d="M10.5 3L13.5 3L14 5.5L15.18 5.99L17.3 4.58L19.42 6.7L18.01 8.82L18.5 10L21 10.5L21 13.5L18.5 14L18.01 15.18L19.42 17.3L17.3 19.42L15.18 18.01L14 18.5L13.5 21L10.5 21L10 18.5L8.82 18.01L6.7 19.42L4.58 17.3L5.99 15.18L5.5 14L3 13.5L3 10.5L5.5 10L5.99 8.82L4.58 6.7L6.7 4.58L8.82 5.99L10 5.5Z"/><circle cx="12" cy="12" r="3"/>',
   expand: '<path d="M8 3H3v5m13-5h5v5M3 16v5h5m13-5v5h-5"/>',
   minimize: '<path d="M5 12h14"/>',
+  more: '<circle cx="5" cy="12" r="1" fill="currentColor"/><circle cx="12" cy="12" r="1" fill="currentColor"/><circle cx="19" cy="12" r="1" fill="currentColor"/>',
+  pause: '<path d="M8 5v14M16 5v14" stroke-width="3.5"/>',
+  play: '<path d="m8 4 12 8-12 8Z" fill="currentColor" stroke="none"/>',
   hide: '<circle cx="12" cy="12" r="5" fill="currentColor" stroke="none"/>',
   reset: '<path d="M4 11a8 8 0 1 1 2 7M4 4v7h7"/>',
   grip: '<path d="M9 5h.01M15 5h.01M9 12h.01M15 12h.01M9 19h.01M15 19h.01" stroke-width="3"/>',
@@ -14,6 +17,6 @@ const paths = {
 
 /** Only static local SVG markup enters the shadow tree through innerHTML. */
 export function icon(name: keyof typeof paths, size = 18): string {
-  if (name === 'logo') return `<svg viewBox="0 0 128 128" width="${size}" height="${size}" aria-hidden="true">${paths.logo}</svg>`;
+  if (name === 'logo') return `<svg viewBox="0 0 128 128" width="${size}" height="${size}" aria-hidden="true">${paths.logo.replaceAll('#0f766e', '#3e68e8')}</svg>`;
   return `<svg viewBox="0 0 24 24" width="${size}" height="${size}" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${paths[name]}</svg>`;
 }

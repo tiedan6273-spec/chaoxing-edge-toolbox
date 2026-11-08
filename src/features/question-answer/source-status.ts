@@ -1,7 +1,7 @@
 import type { AnswerSourceMode, AnswerSourcesStatus, QuestionAnswerState } from './types';
 
 export interface AnswerSourcePlan {
-  first?: 'bank' | 'ai';
+  first?: 'bank' | 'ai' | 'local';
   fallback: boolean;
   message: string;
 }
@@ -14,6 +14,10 @@ function aiUnavailable(status: AnswerSourcesStatus['ai']): string {
 
 /** The same local readiness rules drive the UI, queue preflight and background provider choice. */
 export function planAnswerSource(source: AnswerSourceMode | null, status: AnswerSourcesStatus, incompleteText = false, aiOnly = false): AnswerSourcePlan {
+  if (status.local?.enabled && status.local.selectedCount === 0) return { fallback: false, message: '本地辅助已开启，请至少选择一个有题目的已启用题库。' };
+  if (status.local?.enabled && status.local.selectedCount > 0) return { first: 'local', fallback: status.local.onlineFallback && source !== 'local',
+    message: `先查已选的 ${status.local.selectedCount} 个本地题库；${status.local.onlineFallback && source !== 'local' ? '未匹配时按所选在线来源补充。' : '未匹配时保留待处理，不请求在线服务。'}` };
+  if (source === 'local') return { fallback: false, message: '请启用本地题库辅助，并至少选择一个有题目的已启用题库。' };
   if (!source) return { fallback: false, message: '请先选择答题来源，选择后才会请求答案。'
     + (!status.bank.configured && !status.ai.configured ? '尚未配置 AI 或言溪题库，至少配置一种即可。' : '') };
   const aiReady = status.ai.enabled && status.ai.configured && status.ai.authorized;

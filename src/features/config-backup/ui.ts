@@ -74,7 +74,7 @@ export function mountConfigBackup(root: HTMLElement, restored: () => void): () =
         const parsed = parseConfigBackup(await selected.text());
         if (disposed || current !== revision) return;
         pending = parsed;
-        summary.textContent = `将恢复：${[...(parsed.api ? ['API 地址、模型及密钥'] : []), ...(parsed.questionBank ? ['言溪题库 Token'] : [])].join('；')}。`;
+        summary.textContent = `将恢复：${[...(parsed.api ? ['API 地址、模型及密钥'] : []), ...(parsed.apiProfiles ? [`${parsed.apiProfiles.profiles.length} 个模型、优先级及密钥`] : []), ...(parsed.questionBank ? ['言溪题库 Token'] : [])].join('；')}。`;
         tell('备份已校验，请确认恢复项目后点击恢复。');
       } catch { if (current === revision) tell('备份文件无效、版本不支持或过大，已有配置未修改。', true); }
       finally { if (current === revision) { busy = false; render(); } }

@@ -1,3 +1,5 @@
+import type { ZjoocStartPosition } from './start-position';
+
 export type ZjoocStudyPhase = 'disabled' | 'unsupported' | 'waiting' | 'running' | 'confirming' | 'paused' | 'complete';
 
 export interface ZjoocStudyState {
@@ -8,6 +10,7 @@ export interface ZjoocStudyState {
   chapterTitle: string;
   resourceTitle: string;
   playbackRate?: number;
+  availablePlaybackRates: number[];
   completed: number;
   pendingConfirmation: string[];
   skipped: string[];
@@ -23,6 +26,7 @@ export interface ZjoocStudyProcessed {
 export interface ZjoocStudySession {
   courseKey: string;
   paused: boolean;
+  start?: ZjoocStartPosition;
   cursor?: { chapterIndex: number; resourceId?: string };
   processed?: ZjoocStudyProcessed[];
 }
@@ -36,6 +40,7 @@ export interface ZjoocStudyController {
   getState(): ZjoocStudyState;
   subscribe(listener: (state: ZjoocStudyState) => void): () => void;
   start(recheck?: boolean): void;
+  startFromCurrent(): void;
   stop(): void;
   settingsChanged(): void;
   dispose(): void;

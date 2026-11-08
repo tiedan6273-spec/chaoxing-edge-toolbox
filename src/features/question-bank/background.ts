@@ -1,5 +1,5 @@
 import { broadcastPublic, privateStorageReady, type BackgroundRoutes } from '../../core/background-context';
-import { readStoredApiConfig, withApiConfigMutation } from '../api-settings/background';
+import { readStoredApiSettings, withApiConfigMutation } from '../api-settings/background';
 import { apiOrigin } from '../api-settings/types';
 import {
   QUESTION_BANK_ORIGIN, QUESTION_BANK_SETTINGS_KEY, emptyQuestionBankConfig, normalizeQuestionBankConfig,
@@ -31,7 +31,7 @@ export async function readQuestionBankStatus(): Promise<QuestionBankStatus> {
 }
 
 export const questionBankRoutes: BackgroundRoutes = {
-  'toolbox:question-bank:status': { access: 'public', platforms: ['chaoxing'], handle: async () => readQuestionBankStatus() },
+  'toolbox:question-bank:status': { access: 'public', platforms: ['chaoxing', 'zjooc'], handle: async () => readQuestionBankStatus() },
   'toolbox:question-bank:read': { access: 'options', handle: async () => readStoredQuestionBankConfig() },
   'toolbox:question-bank:save': { access: 'options', handle: async (message) => withApiConfigMutation(async () => {
     const config = normalizeQuestionBankConfig(message.config);
@@ -45,13 +45,13 @@ export const questionBankRoutes: BackgroundRoutes = {
     await chrome.storage.local.set({ [QUESTION_BANK_SETTINGS_KEY]: emptyQuestionBankConfig() });
     // Optional host permissions can be shared by the user's configured model endpoint.
     let shared = false;
-    try { const api = await readStoredApiConfig(); shared = Boolean(api.endpoint && apiOrigin(api.endpoint) === QUESTION_BANK_ORIGIN); } catch { /* Invalid model config cannot own a permission. */ }
+    try { const api = await readStoredApiSettings(); shared = api.profiles.some(p => apiOrigin(p.config.endpoint) === QUESTION_BANK_ORIGIN); } catch { /* Invalid model config cannot own a permission. */ }
     if (!shared) { try { await chrome.permissions.remove({ origins: [QUESTION_BANK_ORIGIN] }); } catch { /* The token is already cleared. */ } }
   }) },
 };
 
 export function subscribeStoredQuestionBank(): void {
-  const changed = () => { void broadcastPublic({ type: 'toolbox:question-bank:changed' }, ['chaoxing']); };
+  const changed = () => { void broadcastPublic({ type: 'toolbox:question-bank:changed' }, ['chaoxing', 'zjooc']); };
   chrome.storage.onChanged.addListener((changes, area) => {
     if (area === 'local' && changes[QUESTION_BANK_SETTINGS_KEY]) changed();
   });

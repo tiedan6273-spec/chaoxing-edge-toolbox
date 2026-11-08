@@ -10,7 +10,7 @@ button:disabled { cursor: not-allowed; }
 [hidden] { display: none !important; }
 :focus-visible { outline: 2px solid var(--focus-ring); outline-offset: 2px; }
 
-header { display: flex; align-items: center; gap: 10px; padding: 12px; background: var(--surface); border-bottom: 1px solid var(--border-inner); }
+header { display: flex; align-items: center; gap: 10px; padding: 12px; background: var(--comic-yellow); border-bottom: 2px solid var(--comic-ink); }
 .brand-mark { display: grid; place-items: center; flex: 0 0 32px; height: 32px; }
 .brand-mark svg { display: block; width: 32px; height: 32px; }
 .brand-copy { flex: 1; min-width: 0; }
@@ -20,11 +20,11 @@ h1 { color: var(--text-title); font-size: 14px; line-height: 1.5; }
 .settings-link:hover { background: var(--tint-bg); border-color: var(--tint-border); }
 
 main { padding: 12px; }
-.launcher { padding: 14px; background: var(--surface); border: 1px solid var(--border-inner); border-radius: var(--radius-lg); box-shadow: var(--shadow-card); }
+.launcher { padding: 14px; background: var(--surface); border: 2px solid var(--comic-ink); border-radius: var(--radius-lg); box-shadow: var(--shadow-card); }
 #page-hint { color: var(--text-title); font-size: 14px; font-weight: 600; }
 .hint { margin-top: 6px; color: var(--text-muted); font-size: 12px; line-height: 1.65; }
 #page-details { min-height: 3.3em; }
-.primary { display: flex; align-items: center; justify-content: center; width: 100%; min-height: var(--control-height); margin-top: 14px; padding: 7px 12px; border: 1px solid var(--primary); border-radius: var(--radius-md); background: var(--primary); color: var(--text-on-primary); font-size: 13px; font-weight: 600; line-height: 1.5; box-shadow: var(--shadow-card); }
+.primary { display: flex; align-items: center; justify-content: center; width: 100%; min-height: var(--control-height); margin-top: 14px; padding: 7px 12px; border: 2px solid var(--comic-ink); border-radius: var(--radius-md); background: var(--primary); color: var(--text-on-primary); font-size: 13px; font-weight: 700; line-height: 1.5; box-shadow: var(--shadow-card); }
 .primary:hover:not(:disabled) { background: var(--primary-hover); border-color: var(--primary-hover); }
 .primary:disabled { background: var(--border-inner); border-color: var(--border-inner); color: var(--text-muted); }
 .panel-note { display: flex; align-items: center; min-height: var(--control-height); margin-top: 14px; padding: 6px 10px; border: 1px solid var(--border-inner); border-radius: var(--radius-md); background: var(--surface-page); color: var(--text-body); font-size: 12px; }

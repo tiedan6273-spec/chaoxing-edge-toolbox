@@ -1,9 +1,9 @@
-import { requestChatCompletion, type ChatContentPart, type ChatMessage } from '../api-settings/model-client';
+import { requestChatCompletion, type ChatContentPart, type ChatMessage } from '../api-settings/metered-client';
 import type { ApiConfig } from '../api-settings/types';
 import { normalizeAnswer } from './normalize';
 import { isApplicableAnswer, isQuestionTextRecognition } from './protocol';
 import type {
-  ApplicableAnswer, QuestionChild, QuestionField, QuestionKind, QuestionOption, QuestionSnapshot, QuestionTextRecognition,
+  ApplicableAnswer, AnswerRow, QuestionChild, QuestionField, QuestionKind, QuestionOption, QuestionSnapshot, QuestionTextRecognition,
 } from './types';
 
 const MAX_REVIEW_ITEMS = 300;
@@ -85,7 +85,25 @@ export function isCompleteApplicableAnswer(question: QuestionSnapshot, answer?: 
 }
 
 export function sameApplicableAnswer(left?: ApplicableAnswer, right?: ApplicableAnswer): boolean {
-  return JSON.stringify(left) === JSON.stringify(right);
+  const canonical = (a?: ApplicableAnswer) => a && ({
+    ...(a.choices ? { choices: [...a.choices].sort() } : {}),
+    ...(a.texts ? { texts: a.texts } : {}), ...(a.matches ? { matches: a.matches } : {}),
+    ...(a.code !== undefined ? { code: a.code } : {}),
+    ...(a.children ? { children: a.children.map(c => ({ id: c.id, choices: [...c.choices].sort() })).sort((a, b) => a.id.localeCompare(b.id)) } : {}),
+  });
+  return JSON.stringify(canonical(left)) === JSON.stringify(canonical(right));
+}
+
+/** Compare complete answers, never treat an empty page or partial stream as a discrepancy. */
+export function answerDifference(row: AnswerRow): AnswerRow['review'] {
+  if (row.review) return row.review;
+  if (!['ai', 'bank-ai', 'import'].includes(row.source ?? '') || !row.resultAnswer) return;
+  const question = row.target.question;
+  const current = normalizeAnswer(question, row.currentAnswer);
+  const result = normalizeAnswer(question, row.resultAnswer);
+  if (!current || !result || !isCompleteApplicableAnswer(question, current) || !isCompleteApplicableAnswer(question, result)
+      || sameApplicableAnswer(current, result)) return;
+  return { status: 'suspect', suggestedAnswer: result, reason: '当前页面答案与 AI 参考答案不一致，请结合题目核对。' };
 }
 
 const programInfo = (value: unknown): boolean => {
@@ -212,7 +230,7 @@ export function buildQuestionReviewMessages(request: QuestionReviewRequest, conf
       '每个 questionId 必须返回且只能返回一条结果。禁止遗漏、重复、增加未知 questionId 或输出额外字段。',
       '只返回一个 JSON 对象，不要 Markdown 围栏、解释前后缀或推理过程。根结构必须严格为：',
       '{"version":1,"mode":"review","batchId":"<原 batchId>","items":[...]}',
-      'pass 只能含 questionId、status，不能附加答案或原因。suspect 必须含可应用且不同于 currentAnswer 的 suggestedAnswer 和简短 reason。uncertain 必须含简短 reason，不能附加 suggestedAnswer。',
+      'pass 必须含 questionId、status、suggestedAnswer（独立求解的完整答案）；suspect 必须含 questionId、status、suggestedAnswer 和简短 reason。uncertain 必须含 questionId、status、简短 reason，不能附加 suggestedAnswer。程序将自行比较 suggestedAnswer 与当前答案。',
       'suggestedAnswer 必须沿用题型结构：选择/判断用 choices 和给定选项 id，多选可含多个 id；completion 用 texts；line 用 matches；fill/reader 用 children。不得自造 id。',
       'program 的 suggestedAnswer 用 {"code":"完整源代码"}；使用题目给出的编程语言，输出完整可提交代码，不要只给片段或 Markdown 围栏。',
       '若题目信息不足、图片无法辨认或无法唯一判断，返回 uncertain。填空答案若只是措辞不同且不能确认语义等价，返回 uncertain，不要标为 suspect。',
@@ -243,8 +261,12 @@ export function parseQuestionReview(request: QuestionReviewRequest, text: string
     const requestItem = byId.get(candidate.questionId)!;
     seen.add(candidate.questionId);
     if (candidate.status === 'pass') {
-      if (!exactKeys(candidate, ['questionId', 'status'])) throw new QuestionReviewError('AI 的 pass 结果包含额外字段，整卷结果已拒绝。');
-      items.push({ questionId: candidate.questionId, status: 'pass' });
+      if (!exactKeys(candidate, ['questionId', 'status']) && !exactKeys(candidate, ['questionId', 'status', 'suggestedAnswer'])) throw new QuestionReviewError('AI 的 pass 结果包含额外字段，整卷结果已拒绝。');
+      const suggestion = candidate.suggestedAnswer === undefined ? undefined : normalizeAnswer(snapshotForNormalization(requestItem), candidate.suggestedAnswer);
+      if (candidate.suggestedAnswer !== undefined && (!suggestion || !isCompleteApplicableAnswer(snapshotForNormalization(requestItem), suggestion))) throw new QuestionReviewError('AI 的独立答案不完整，整卷结果已拒绝。');
+      items.push(suggestion && !sameApplicableAnswer(suggestion, requestItem.currentAnswer)
+        ? { questionId: candidate.questionId, status: 'suspect', suggestedAnswer: suggestion, reason: 'AI 独立答案与当前页面答案不一致，请核对。' }
+        : { questionId: candidate.questionId, status: 'pass' });
       continue;
     }
     if (!boundedText(candidate.reason, MAX_REASON_LENGTH) || !candidate.reason.trim()) {
@@ -262,10 +284,11 @@ export function parseQuestionReview(request: QuestionReviewRequest, text: string
       throw new QuestionReviewError('AI 的 suspect 结果结构无效，整卷结果已拒绝。');
     }
     const suggestion = normalizeAnswer(snapshotForNormalization(requestItem), candidate.suggestedAnswer);
-    if (!suggestion || sameApplicableAnswer(suggestion, requestItem.currentAnswer)) {
+    if (!suggestion || !isCompleteApplicableAnswer(snapshotForNormalization(requestItem), suggestion)) {
       throw new QuestionReviewError('AI 给出的建议答案无法通过题型校验、与当前答案相同或结构不完整，整卷结果已拒绝。');
     }
-    items.push({ questionId: candidate.questionId, status: 'suspect', suggestedAnswer: suggestion, reason });
+    items.push(sameApplicableAnswer(suggestion, requestItem.currentAnswer) ? { questionId: candidate.questionId, status: 'pass' }
+      : { questionId: candidate.questionId, status: 'suspect', suggestedAnswer: suggestion, reason });
   }
   if (seen.size !== request.items.length) throw new QuestionReviewError('AI 复检结果遗漏题目，整卷结果已拒绝。');
   return { batchId: request.batchId, items };

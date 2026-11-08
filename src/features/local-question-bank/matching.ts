@@ -2,6 +2,7 @@ import type { BankEntry } from '../answer-exchange/types';
 import { normalizeAnswer } from '../question-answer/normalize';
 import type { ApplicableAnswer, QuestionOption, QuestionSnapshot } from '../question-answer/types';
 import type { LocalBankMatch } from './types';
+import { judgementMeaning } from './semantic';
 
 // NFC preserves formula symbols, superscripts, case, punctuation and negation.
 const normalized = (value: string): string => value.normalize('NFC').replace(/\s+/g, ' ').trim();
@@ -30,7 +31,9 @@ export function localQuestionContentKey(question: QuestionSnapshot): string | un
   const positionDependent = positionReference.test([stem, ...question.options.map(option => option.text),
     ...question.fields.flatMap(field => field.options?.map(option => option.text) ?? []),
     ...question.children.flatMap(child => [child.stem, ...child.options.map(option => option.text)])].join('\n'));
-  const options = optionShape(question.options, !positionDependent, positionDependent);
+  const canonicalOptions = question.kind === 'judgement' ? question.options.map(option => ({ ...option,
+    text: judgementMeaning(option.text) === true ? '正确' : judgementMeaning(option.text) === false ? '错误' : option.text })) : question.options;
+  const options = optionShape(canonicalOptions, !positionDependent, positionDependent);
   if (!options) return;
   const fields = question.fields.map(field => field.options?.length ? optionShape(field.options, false, positionDependent) : null);
   const children = question.children.map(child => ({ stem: normalized(child.stem), options: optionShape(child.options, false, positionDependent) }));
@@ -54,8 +57,12 @@ function remapAnswer(source: QuestionSnapshot, target: QuestionSnapshot, raw: Ap
   if (!answer) return;
   let mapped: ApplicableAnswer | undefined;
   if (answer.choices) {
-    const choices = optionIds(source.options, target.options, answer.choices);
-    if (choices) mapped = { choices };
+    const choices = source.kind === 'judgement' ? answer.choices.map(id => {
+      const option = source.options.find(item => item.id === id); const meaning = option && judgementMeaning(option.text);
+      const candidates = meaning === undefined ? [] : target.options.filter(item => judgementMeaning(item.text) === meaning);
+      return candidates.length === 1 ? candidates[0].id : undefined;
+    }) : optionIds(source.options, target.options, answer.choices);
+    if (choices?.every((id): id is string => typeof id === 'string')) mapped = { choices };
   } else if (answer.texts) mapped = { texts: answer.texts };
   else if (answer.code !== undefined) mapped = { code: answer.code };
   else if (answer.matches) {

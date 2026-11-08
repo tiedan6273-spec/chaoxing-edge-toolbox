@@ -91,20 +91,27 @@ export function mountToolboxSettings(root: HTMLElement): () => void {
     }
   }
 
-  for (const platformId of ['chaoxing', 'zjooc'] satisfies PlatformId[]) {
+  const groups = [
+    { id: 'shared', label: '学习通与浙学共用', features: FEATURES.filter(feature => feature.supportedPlatforms.length > 1) },
+    ...(['chaoxing', 'zjooc'] satisfies PlatformId[]).map(platformId => ({
+      id: platformId, label: getPlatformById(platformId).label,
+      features: FEATURES.filter(feature => feature.supportedPlatforms.length === 1 && isFeatureSupported(feature.id, platformId)),
+    })),
+  ];
+  for (const descriptor of groups) {
     const group = document.createElement('section');
-    group.dataset.platform = platformId;
+    group.dataset.platform = descriptor.id;
     const heading = document.createElement('div');
     heading.className = 'section-heading';
     const title = document.createElement('h3');
     title.className = 'control-title';
-    title.id = `platform-${platformId}`;
-    title.textContent = getPlatformById(platformId)?.label ?? platformId;
+    title.id = `platform-${descriptor.id}`;
+    title.textContent = descriptor.label;
     group.setAttribute('aria-labelledby', title.id);
     heading.append(title);
     group.append(heading);
     list.append(group);
-    for (const feature of FEATURES.filter(feature => isFeatureSupported(feature.id, platformId))) {
+    for (const feature of descriptor.features) {
       const row = document.createElement('div');
       row.className = 'feature-row';
       const copy = document.createElement('div');
@@ -120,6 +127,7 @@ export function mountToolboxSettings(root: HTMLElement): () => void {
       location.className = 'feature-location';
       location.id = `location-${feature.id}`;
       location.textContent = locations[feature.id] ?? '在网页悬浮工具箱中操作。';
+      if (descriptor.id === 'shared') location.textContent += '此开关同时应用于学习通与浙学。';
       copy.append(label, description, location);
       const toggle = document.createElement('label');
       toggle.className = 'switch';

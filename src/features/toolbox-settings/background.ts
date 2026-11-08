@@ -1,6 +1,8 @@
 import { broadcastPublic, isExtensionPage, senderPlatform, privateStorageReady, type BackgroundRoutes } from '../../core/background-context';
 import { FEATURES, isFeatureId, isFeatureSupported } from '../catalog';
 import { normalizeSettings, SETTINGS_KEY, type Settings } from '../../shared/settings';
+import { isZjoocPlaybackRate } from '../zjooc-study/playback-rate';
+import { isZjoocStartMode } from '../zjooc-study/start-position';
 
 export const SETTINGS_READ = 'toolbox:settings:read';
 export const SETTINGS_WRITE = 'toolbox:settings:write';
@@ -21,13 +23,20 @@ export const settingsRoutes: BackgroundRoutes = {
     const value = input as Settings;
     if (value.version !== 1 || typeof value.enabled !== 'boolean' || !value.features
         || Object.entries(value.features).some(([key, enabled]) => !isFeatureId(key) || typeof enabled !== 'boolean')
-        || FEATURES.some((feature) => typeof value.features[feature.id] !== 'boolean')) throw new Error('无效的功能设置。');
+        || FEATURES.some((feature) => typeof value.features[feature.id] !== 'boolean')
+        || (value.zjoocPlaybackRate !== undefined && !isZjoocPlaybackRate(value.zjoocPlaybackRate))
+        || (value.zjoocStartMode !== undefined && !isZjoocStartMode(value.zjoocStartMode))) throw new Error('无效的功能设置。');
     const next = normalizeSettings(value);
     const task = writes.then(async () => {
       await privateStorageReady;
+      const current = await readStoredSettings();
+      // Older v1 clients do not send this field. Preserve their existing preference.
+      if (value.zjoocPlaybackRate === undefined) next.zjoocPlaybackRate = current.zjoocPlaybackRate;
+      if (value.zjoocStartMode === undefined) next.zjoocStartMode = current.zjoocStartMode;
       if (!isExtensionPage(sender)) {
-        const current = await readStoredSettings();
         const platform = senderPlatform(sender);
+        if (platform !== 'zjooc') next.zjoocPlaybackRate = current.zjoocPlaybackRate;
+        if (platform !== 'zjooc') next.zjoocStartMode = current.zjoocStartMode;
         for (const feature of FEATURES) {
           if (!isFeatureSupported(feature.id, platform)) next.features[feature.id] = current.features[feature.id];
         }

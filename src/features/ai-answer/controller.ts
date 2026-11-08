@@ -1,6 +1,6 @@
 import { isThinkLadderUrl, readThinkLadderState } from './adapters/think-ladder';
 import type {
-  AiAnswerController, AiAnswerState, AiControllerDependencies, AnswerSnapshot, CurrentQuestion,
+  AiAnswerController, AiAnswerState, AiControllerDependencies, AnswerSnapshot, CurrentQuestion, AiGeneratedAnswer,
 } from './types';
 
 const STABLE_DELAY_MS = 800;
@@ -42,6 +42,7 @@ export function createAiAnswerController(deps: AiControllerDependencies): AiAnsw
   let polling = false;
   let token = '';
   let active: ActiveTask | undefined;
+  let reference: { question: CurrentQuestion; snapshot: AnswerSnapshot; result: AiGeneratedAnswer } | undefined;
   let timer: ReturnType<typeof setTimeout> | undefined;
   let mountedChat: Element | null = null;
 
@@ -97,6 +98,7 @@ export function createAiAnswerController(deps: AiControllerDependencies): AiAnsw
     const nextToken = identity(page.question);
     if (nextToken !== token) {
       cancel();
+      reference = undefined;
       token = nextToken;
       publish({
         question: page.question, phase: state.running ? 'waiting' : 'paused',
@@ -140,7 +142,7 @@ export function createAiAnswerController(deps: AiControllerDependencies): AiAnsw
       const configured = await deps.apiConfigured();
       if (disposed || ownRevision !== revision || !state.running) return;
       if (!configured) {
-        publish({ phase: 'needs-config', running: false, message: '请先前往设置页填写并保存 API 配置。', canConfirmReplace: false });
+        publish({ phase: 'needs-config', running: false, message: '当前答案来源未就绪，请检查选库、在线来源和域名授权。', canConfirmReplace: false });
         return;
       }
       const initial = await deps.readAnswer();
@@ -150,7 +152,7 @@ export function createAiAnswerController(deps: AiControllerDependencies): AiAnsw
         publish({ phase: 'waiting', message: initial.error ?? '等待答题编辑器就绪。', canConfirmReplace: false });
         return;
       }
-      if (initial.hasContent && !replace) {
+      if (initial.hasContent && !replace && state.mode !== 'search') {
         // A blocked question is also attempted so DOM mutations cannot bypass consent.
         attempted.add(currentToken);
         publish({ phase: 'blocked', message: '答题框已有内容，暂不生成。', canConfirmReplace: true });
@@ -161,12 +163,19 @@ export function createAiAnswerController(deps: AiControllerDependencies): AiAnsw
       attempted.add(currentToken);
       publish({ phase: 'generating', message: '正在独立生成本题回答…', answer: '', canConfirmReplace: false });
       try {
-        const answer = await deps.generate(question, task.abort.signal, (text) => {
+        const generated = reference && identity(reference.question) === currentToken && reference.snapshot.version === initial.version
+          ? reference.result : await deps.generate(question, task.abort.signal, (text) => {
           if (taskCurrent(task) && text !== state.answer) publish({ answer: text });
         }, message => { if (taskCurrent(task)) publish({ message }); });
         if (!taskCurrent(task)) return;
-        publish({ answer });
+        const result = typeof generated === 'string' ? { text: generated } : generated;
+        const answer = result.text;
+        reference = { question, snapshot: initial, result };
+        publish({ answer, source: result.source, applyNeedsReplace: initial.hasContent });
         if (!answer.trim()) throw new Error('模型没有返回有效回答，请检查配置后重试。');
+        if (state.mode === 'search') {
+          active = undefined; publish({ phase: 'searched', running: false, message: '已获取参考答案，尚未填写。', canConfirmReplace: false }); return;
+        }
         await deps.waitBeforeFill?.(startedAt, task.abort.signal, message => { if (taskCurrent(task)) publish({ message }); });
         if (!taskCurrent(task)) return;
         if (!sameQuestion(question)) { inspect(); return; }
@@ -178,10 +187,12 @@ export function createAiAnswerController(deps: AiControllerDependencies): AiAnsw
           blockForEdit('生成期间答题框发生变化，已保留你的编辑；生成的回答仍可查看。');
           return;
         }
-        task.writing = true;
-        const result = await deps.writeAnswer({ question, expectedVersion: initial.version, text: answer });
+        if (deps.validateResult && !await deps.validateResult(result)) throw new Error('本地题库已变化，请重新查询答案。');
         if (!taskCurrent(task)) return;
-        if (!result.ok) throw new Error(result.error ?? '未能填入答题框，生成的回答已保留。');
+        task.writing = true;
+        const writeResult = await deps.writeAnswer({ question, expectedVersion: initial.version, text: answer });
+        if (!taskCurrent(task)) return;
+        if (!writeResult.ok) throw new Error(writeResult.error ?? '未能填入答题框，生成的回答已保留。');
         filled.add(currentToken);
         active = undefined;
         publish({ phase: 'filled', message: '已填入并核对答题内容。发送答案及进入下一题由你操作。', canConfirmReplace: false });
@@ -271,6 +282,30 @@ export function createAiAnswerController(deps: AiControllerDependencies): AiAnsw
       return () => { listeners.delete(listener); };
     },
     start, stop,
+    setMode(mode) {
+      if (mode !== 'fill' && mode !== 'search') return;
+      cancel(); publish({ mode, running: false, phase: reference ? 'searched' : 'paused', message: mode === 'search' ? '只搜题模式，点击开始获取参考答案。' : '自动填写模式，点击开始后处理。' });
+    },
+    applyResult(replace = false) {
+      const cached = reference;
+      if (!cached || evaluating || active || state.running || !deps.isEnabled() || !sameQuestion(cached.question)) return;
+      cancel(); const ownRevision = revision; evaluating = true;
+      void (async () => {
+        try {
+          const current = await deps.readAnswer();
+          if (disposed || revision !== ownRevision || !sameQuestion(cached.question) || !deps.isEnabled()) return;
+          if (!current.ready || current.version !== cached.snapshot.version) throw new Error('答题框已变化，请重新查询；保留了你的编辑。');
+          if (current.hasContent && !replace) throw new Error('答题框已有内容，需要明确确认覆盖。');
+          if (deps.validateResult && !await deps.validateResult(cached.result)) throw new Error('本地题库已变化，请重新查询。');
+          if (disposed || revision !== ownRevision || !sameQuestion(cached.question) || !deps.isEnabled()) return;
+          const result = await deps.writeAnswer({ question: cached.question, expectedVersion: current.version, text: cached.result.text });
+          if (disposed || revision !== ownRevision) return;
+          if (!result.ok) throw new Error(result.error ?? '填写未成功，参考答案已保留。');
+          filled.add(identity(cached.question)); publish({ phase: 'filled', message: '参考答案已填入并回读；发送及下一题由你操作。' });
+        } catch (e) { if (!disposed && ownRevision === revision) publish({ phase: 'error', message: e instanceof Error ? e.message : '填写失败，参考答案已保留。' }); }
+        finally { evaluating = false; }
+      })();
+    },
     confirmReplace() {
       if (!state.canConfirmReplace || !state.question || !sameQuestion(state.question) || !deps.isEnabled()) return;
       clearTimer();
@@ -288,6 +323,7 @@ export function createAiAnswerController(deps: AiControllerDependencies): AiAnsw
     },
     settingsChanged() {
       cancel();
+      reference = undefined;
       publish({ running: false, phase: 'paused', canConfirmReplace: false,
         message: deps.isEnabled() ? '设置已更新，点击开始继续。' : 'AI 作答功能已关闭。' });
       inspect();

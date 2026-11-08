@@ -1,0 +1,17 @@
+Offline OCR components (unmodified runtime and model assets)
+
+Tesseract.js 7.0.0: https://github.com/naptha/tesseract.js
+Tesseract.js-core 7.0.0: https://github.com/naptha/tesseract.js-core
+Both runtime packages declare Apache-2.0; their LICENSE and package.json are included.
+
+@tesseract.js-data/chi_sim and @tesseract.js-data/eng 1.0.0:
+https://github.com/naptha/tessdata
+The original npm package metadata declares MIT and is retained without modification.
+Bundled data: 4.0.0_best_int/<language>.traineddata.gz (integer LSTM models).
+The upstream tessdata repository provides the Apache-2.0 license, included as
+TESSDATA-LICENSE.txt from https://raw.githubusercontent.com/naptha/tessdata/gh-pages/LICENSE
+Retrieved 2026-11-08. Model bytes are copied from the locked npm packages.
+SHA256.json records the shipped worker, core and language asset checksums.
+
+All worker scripts, WASM cores and language files load from the extension.
+No OCR image or document content is sent to a remote service.

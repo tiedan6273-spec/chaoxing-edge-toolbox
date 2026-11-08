@@ -38,14 +38,14 @@ export function isPlatformUrl(value: string | undefined, platform: PlatformId): 
   return getPlatform(value)?.id === platform;
 }
 
-/** Inherited blank editor frames retain Chaoxing's existing MAIN-world support. */
+/** Blank frames inherit only an explicitly supported parent/referrer. */
 export function getDocumentPlatform(win: Window): Platform | undefined {
   const platform = getPlatform(win.location.href);
   if (platform || !['about:blank', 'about:srcdoc'].includes(win.location.href)) return platform;
   try {
     const parent = getPlatform(win.parent.location.href);
-    if (parent?.id === 'chaoxing') return parent;
+    if (parent) return parent;
   } catch { /* Cross-origin blank frames can use their browser-provided referrer. */ }
   const referrer = getPlatform(win.document.referrer);
-  return referrer?.id === 'chaoxing' ? referrer : undefined;
+  return referrer;
 }

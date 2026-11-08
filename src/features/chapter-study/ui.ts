@@ -7,6 +7,7 @@ import { readNotificationSettings, subscribeNotificationSettings, writeNotificat
 import type { StudyNotificationSettings } from './notifications';
 import { createQuestionAnswerView } from '../question-answer/ui';
 import { createSceneToolsView } from '../page-tools/ui';
+import { createDiagnosticView, locateLearningContent } from '../activity/diagnostics';
 
 const phaseLabels: Record<StudyPhase, string> = {
   disabled: '未启用', unsupported: '暂不支持', waiting: '等待页面', running: '学习中',
@@ -41,11 +42,11 @@ export function createChapterStudyView(context: WorkspaceContext): WorkspaceView
       <p class="study-rate-warning" id="cx-study-rate-warning" role="status" aria-live="polite" aria-atomic="true" hidden></p>
       <p class="study-preference-feedback" role="status" aria-live="polite" hidden></p>
     </fieldset></details>
-    <div class="study-answer-source" hidden><label class="study-field" for="cx-study-answer-source"><span>测验答题来源</span><select id="cx-study-answer-source"><option value="" disabled>请选择答题来源</option><option value="prefer-bank">言溪优先，AI 补充</option><option value="bank">仅言溪</option><option value="ai">仅 AI</option></select></label><p class="answer-config-status" role="status" aria-live="polite"></p><div class="study-actions"><button class="button" type="button" data-study-answer-settings="api">AI 设置</button><button class="button" type="button" data-study-answer-settings="question-bank">言溪设置</button><button class="button" type="button" data-study-answer-settings="features">功能设置</button><button class="button" type="button" data-study-answer-recheck hidden>重新检查</button></div></div>
+    <div class="study-answer-source" hidden><label class="study-field" for="cx-study-answer-source"><span>测验答题来源</span><select id="cx-study-answer-source"><option value="" disabled>请选择答题来源</option><option value="local">仅本地题库</option><option value="prefer-bank">言溪优先，AI 补充</option><option value="bank">仅言溪</option><option value="ai">仅 AI</option></select></label><p class="answer-config-status" role="status" aria-live="polite"></p><div class="study-actions"><button class="button" type="button" data-study-answer-settings="api">AI 设置</button><button class="button" type="button" data-study-answer-settings="question-bank">言溪设置</button><button class="button" type="button" data-study-answer-settings="features">功能设置</button><button class="button" type="button" data-study-answer-recheck hidden>重新检查</button></div></div>
     <div class="study-progress">
       <p class="study-chapter"></p><p class="study-task"></p>
       <p class="study-message" role="status" aria-live="polite" aria-atomic="true"></p>
-      <div class="study-progress-footer"><p class="study-count"></p><div class="study-actions"><button class="button primary" type="button" data-study-action="start">开始学习</button><button class="button" type="button" data-study-action="stop" hidden>暂停</button></div></div>
+      <div class="study-progress-footer"><p class="study-count"></p><div class="study-actions"><button class="button primary" type="button" data-study-action="start">开始学习</button><button class="button primary" type="button" data-study-action="stop" hidden>暂停</button></div></div>
     </div>
     <div class="study-quiz-controls">
       <label class="study-field" for="cx-study-chapter-answer-finish"><span>测验完成后</span><select id="cx-study-chapter-answer-finish" aria-describedby="cx-study-chapter-answer-help"><option value="save">暂时保存并继续（默认）</option><option value="submit">全部填好后提交并继续</option><option value="stay">停留检查</option></select></label>
@@ -99,6 +100,8 @@ export function createChapterStudyView(context: WorkspaceContext): WorkspaceView
   const notificationHelp = element<HTMLElement>('#cx-study-notification-help');
   const feedback = element<HTMLElement>('.study-preference-feedback');
   const message = element<HTMLElement>('.study-message');
+  const diagnostic = createDiagnosticView({ locate: locateLearningContent });
+  message.after(diagnostic.element);
   const chapter = element<HTMLElement>('.study-chapter');
   const task = element<HTMLElement>('.study-task');
   const count = element<HTMLElement>('.study-count');
@@ -130,6 +133,7 @@ export function createChapterStudyView(context: WorkspaceContext): WorkspaceView
   function render(): void {
     if (disposed) return;
     const enabled = Boolean(settings?.enabled && settings.features['chapter-study']);
+    diagnostic.update(enabled ? state.message : '', state.phase === 'error', state.running);
     const quiz = state.taskType === 'chapter-test' || (!state.taskType && Boolean(answerState?.papers?.some(value => value.scene === 'chapter-test')));
     if (quiz !== lastQuiz) {
       playback.open = !quiz;
@@ -266,7 +270,7 @@ export function createChapterStudyView(context: WorkspaceContext): WorkspaceView
   answerSource.addEventListener('change', () => {
     if (answerSource.disabled) return;
     const value = answerSource.value;
-    if (value === 'ai' || value === 'bank' || value === 'prefer-bank') context.questionAnswer?.setSource(value);
+    if (value === 'ai' || value === 'bank' || value === 'prefer-bank' || value === 'local') context.questionAnswer?.setSource(value);
   }, { signal });
   const openNotificationSettings = () => {
     void context.openSettings('features').catch(() => {
@@ -313,6 +317,7 @@ export function createChapterStudyView(context: WorkspaceContext): WorkspaceView
   render();
   return {
     element: root,
+    actions: root.querySelector<HTMLElement>('.study-progress-footer')!,
     update(value: Settings | undefined, pending: boolean) { settings = value; saving = pending; render(); },
     refresh() { state = study.getState(); answerView?.refresh?.(); render(); },
     dispose() { disposed = true; unsubscribe(); unsubscribeAnswer?.(); unsubscribeNotifications(); answerView?.dispose(); tools.dispose(); listeners.abort(); root.remove(); },

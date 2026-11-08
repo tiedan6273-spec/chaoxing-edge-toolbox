@@ -3,11 +3,15 @@ import {
   readZjoocRoute, resourcePane, showPlaybackMenu, type ZjoocResource,
 } from './adapters/page';
 import type { ZjoocStudyController, ZjoocStudyProcessed, ZjoocStudyRuntime, ZjoocStudySession, ZjoocStudyState } from './types';
+import { isZjoocPlaybackRate, preferredPlaybackRate, type ZjoocPlaybackRate } from './playback-rate';
+import { readCurrentStartPosition, type ZjoocStartMode } from './start-position';
 
 interface Timing { poll: number; settle: number; load: number; confirmation: number; refreshDelay: number; retry: number; maxRetry: number }
 export interface ZjoocStudyDependencies {
   document: Document;
   isEnabled(): boolean;
+  getPlaybackRate?(): ZjoocPlaybackRate;
+  getStartMode?(): ZjoocStartMode;
   runtime: ZjoocStudyRuntime;
   /** Reload the current document; injectable so isolated tests can recreate the controller. */
   reload?(): void;
@@ -33,11 +37,11 @@ class ContentsChanged extends Error {}
 const cancelled = () => new DOMException('浙学自动学习已取消。', 'AbortError');
 
 /** The isolated-world controller operates native DOM only; it never calls a completion API. */
-export function createZjoocStudyController({ document: doc, isEnabled, runtime, timing, reload = () => doc.defaultView!.location.reload() }: ZjoocStudyDependencies): ZjoocStudyController {
+export function createZjoocStudyController({ document: doc, isEnabled, getPlaybackRate = () => 'highest', getStartMode = () => 'first-unfinished', runtime, timing, reload = () => doc.defaultView!.location.reload() }: ZjoocStudyDependencies): ZjoocStudyController {
   const win = doc.defaultView!;
   const times: Timing = { poll: 100, settle: 300, load: 15000, confirmation: 30000, refreshDelay: 1500, retry: 1000, maxRetry: 10000, ...timing };
   const listeners = new Set<(state: ZjoocStudyState) => void>();
-  let state: ZjoocStudyState = { phase: 'disabled', running: false, message: '浙学自动学习已关闭。', projectTitle: '', chapterTitle: '', resourceTitle: '', completed: 0, pendingConfirmation: [], skipped: [] };
+  let state: ZjoocStudyState = { phase: 'disabled', running: false, message: '浙学自动学习已关闭。', projectTitle: '', chapterTitle: '', resourceTitle: '', completed: 0, pendingConfirmation: [], skipped: [], availablePlaybackRates: [] };
   let session: ZjoocStudySession | undefined;
   let worker: Worker | undefined;
   let disposed = false;
@@ -55,7 +59,7 @@ export function createZjoocStudyController({ document: doc, isEnabled, runtime, 
   const confirmed = new Set<string>();
   const pendingLabels = new Map<string, string>();
 
-  function getState(): ZjoocStudyState { return { ...state, skipped: [...state.skipped], pendingConfirmation: [...state.pendingConfirmation] }; }
+  function getState(): ZjoocStudyState { return { ...state, skipped: [...state.skipped], pendingConfirmation: [...state.pendingConfirmation], availablePlaybackRates: [...state.availablePlaybackRates] }; }
   function emit(update: Partial<ZjoocStudyState>): void {
     if (disposed) return;
     state = { ...state, ...update };
@@ -63,7 +67,7 @@ export function createZjoocStudyController({ document: doc, isEnabled, runtime, 
   }
   function persist(): Promise<void> {
     if (!session) return Promise.resolve();
-    const copy = { ...session, ...(session.cursor ? { cursor: { ...session.cursor } } : {}), ...(session.processed ? { processed: session.processed.map(item => ({ ...item })) } : {}) };
+    const copy = { ...session, ...(session.start ? { start: { ...session.start } } : {}), ...(session.cursor ? { cursor: { ...session.cursor } } : {}), ...(session.processed ? { processed: session.processed.map(item => ({ ...item })) } : {}) };
     writes = writes.catch(() => undefined).then(() => runtime.writeSession(copy));
     return writes;
   }
@@ -96,7 +100,7 @@ export function createZjoocStudyController({ document: doc, isEnabled, runtime, 
     pendingResume = false;
     loadingSession = '';
   }
-  async function changeManualState(courseKey: string, paused: boolean, recheck = false, message = ''): Promise<void> {
+  async function changeManualState(courseKey: string, paused: boolean, recheck = false, message = '', fromCurrent = false): Promise<void> {
     cancelManualChange();
     const current = { courseKey, paused, abort: new AbortController() };
     const revision = ++sessionRevision;
@@ -105,20 +109,60 @@ export function createZjoocStudyController({ document: doc, isEnabled, runtime, 
     loadingSession = '';
     const valid = () => !disposed && !current.abort.signal.aborted && revision === sessionRevision
       && readZjoocRoute(doc.location.href)?.courseKey === courseKey && (paused || isEnabled());
+    const requestedResource = readZjoocRoute(doc.location.href)?.chapterId;
+    let initialized = false;
+    let needsCurrentStart = false;
     let attempts = 0;
     try {
       while (valid()) {
         try {
-          // Explicit enable/resume must load the previous ledger before changing its pause flag.
-          const saved = session?.courseKey === courseKey ? session : await runtime.readSession(courseKey);
-          if (!valid()) return;
-          if (session?.courseKey !== courseKey) { confirmed.clear(); pendingLabels.clear(); }
-          session = saved?.courseKey === courseKey
-            ? { ...saved, paused, cursor: saved.cursor ? { ...saved.cursor } : undefined, processed: saved.processed?.map(item => ({ ...item })) }
-            : { courseKey, paused };
-          if (recheck) session.cursor = { chapterIndex: 0 };
+          if (!initialized) {
+            // Ordinary resume preserves the ledger and range even if the preferred mode changed.
+            const saved = session?.courseKey === courseKey ? session : await runtime.readSession(courseKey);
+            if (!valid()) return;
+            if (session?.courseKey !== courseKey) { confirmed.clear(); pendingLabels.clear(); }
+            session = saved?.courseKey === courseKey
+              ? { ...saved, paused, start: saved.start ? { ...saved.start } : undefined,
+                cursor: saved.cursor ? { ...saved.cursor } : undefined, processed: saved.processed?.map(item => ({ ...item })) }
+              : { courseKey, paused };
+            needsCurrentStart = !paused && (fromCurrent || ((recheck || (!session.cursor && !session.start)) && getStartMode() === 'current-forward'));
+            if (needsCurrentStart) {
+              confirmed.clear(); pendingLabels.clear();
+              session.start = undefined; session.cursor = undefined; session.processed = [];
+              emit({ skipped: [] });
+            } else if (recheck) { session.start = undefined; session.cursor = { chapterIndex: 0 }; }
+            initialized = true;
+          }
+          if (!session || !valid()) return;
+          if (needsCurrentStart) {
+            while (valid()) {
+              if (readZjoocRoute(doc.location.href)?.chapterId !== requestedResource) break;
+              const position = readCurrentStartPosition(doc);
+              if (position) {
+                await delay(times.settle, current.abort.signal);
+                if (!valid()) return;
+                if (JSON.stringify(position) === JSON.stringify(readCurrentStartPosition(doc))) {
+                  session.start = position;
+                  session.cursor = { chapterIndex: position.chapterIndex, resourceId: position.resourceId };
+                  break;
+                }
+              }
+              emit({ phase: 'waiting', running: true, message: '正在等待当前章节和内容加载，确认本次学习起点…' });
+              await delay(times.poll, current.abort.signal);
+            }
+            if (!valid()) return;
+            if (!session.start || readZjoocRoute(doc.location.href)?.chapterId !== requestedResource) {
+              session.paused = true;
+              emit({ phase: 'paused', running: false, message: '定位起点时页面已切换，已暂停。请在目标内容点击“从当前内容开始”。' });
+            }
+          }
           refreshProgress();
           await persist();
+          if (needsCurrentStart && valid() && !session.paused && readZjoocRoute(doc.location.href)?.chapterId !== requestedResource) {
+            session.paused = true;
+            emit({ phase: 'paused', running: false, message: '保存起点时页面已切换，已暂停。请在目标内容点击“从当前内容开始”。' });
+            await persist();
+          }
           return;
         } catch {
           if (!valid()) return;
@@ -176,19 +220,28 @@ export function createZjoocStudyController({ document: doc, isEnabled, runtime, 
   }
 
   function refreshProgress(): void {
-    emit({ completed: confirmed.size, pendingConfirmation: (session?.processed ?? []).filter(item => !confirmed.has(item.resourceId)).map(item => pendingLabels.get(item.resourceId)
+    emit({ completed: confirmed.size, pendingConfirmation: (session?.processed ?? []).filter(item => item.chapterIndex >= (session?.start?.chapterIndex ?? 0) && !confirmed.has(item.resourceId)).map(item => pendingLabels.get(item.resourceId)
       ?? `第 ${item.chapterIndex + 1} 小节 · ${item.kind === 'video' ? '视频已播放结束' : '课件已提交'}，待平台确认`) });
   }
   function syncVisibleConfirmations(): void {
     if (!session || session.courseKey !== readZjoocRoute(doc.location.href)?.courseKey || worker?.transitioning || isZjoocLoading(doc)) return;
-    const resources = readZjoocResources(doc);
-    if (resources.find(item => item.active)?.id !== readZjoocRoute(doc.location.href)?.chapterId) return;
+    const allResources = readZjoocResources(doc);
+    if (allResources.find(item => item.active)?.id !== readZjoocRoute(doc.location.href)?.chapterId) return;
+    const chapters = readZjoocChapters(doc);
+    const chapterIndex = chapters.findIndex(item => item.active);
+    const start = session.start;
+    if (start && (chapters[start.chapterIndex]?.key !== start.chapterKey || chapterIndex < start.chapterIndex)) return;
+    const floor = start && chapterIndex === start.chapterIndex ? allResources.findIndex(item => item.id === start.resourceId) : 0;
+    if (floor < 0) return;
+    const resources = allResources.slice(floor);
+    const excluded = new Set(allResources.slice(0, floor).map(item => item.id));
     const completed = new Set(resources.filter(item => item.completed).map(item => item.id));
     const newlyConfirmed = [...completed].some(id => !confirmed.has(id));
     const noLongerConfirmed = resources.some(item => !item.completed && confirmed.has(item.id));
     const pending = session.processed ?? [];
-    const remaining = pending.filter(item => item.kind === 'video' || !completed.has(item.resourceId)
-      || (item.kind === 'courseware' && (!item.refreshed || worker?.refreshingResource === item.resourceId)));
+    const remaining = pending.filter(item => item.chapterIndex >= (start?.chapterIndex ?? 0) && !excluded.has(item.resourceId)
+      && (item.kind === 'video' || !completed.has(item.resourceId)
+        || (item.kind === 'courseware' && (!item.refreshed || worker?.refreshingResource === item.resourceId))));
     if (!newlyConfirmed && !noLongerConfirmed && remaining.length === pending.length) return;
     for (const item of resources) if (!item.completed) confirmed.delete(item.id);
     for (const id of completed) confirmed.add(id);
@@ -225,7 +278,11 @@ export function createZjoocStudyController({ document: doc, isEnabled, runtime, 
         assertCurrent(current);
         if (error instanceof ManualNavigation || error instanceof ContentsChanged) throw error;
         const detail = error instanceof Attention ? error.message : message;
-        emit({ phase: 'waiting', running: true, message: `${detail || message} 正在自动等待并重试…` });
+        if (attempts >= 3) {
+          pause(`${detail || message} 连续重试仍未恢复，已暂停。请检查原网页后继续。`);
+          throw cancelled();
+        }
+        emit({ phase: 'waiting', running: true, message: `${detail || message} 正在等待并重试（${attempts + 1}/3）…` });
         await delay(Math.min(times.retry * 2 ** Math.min(attempts++, 5), times.maxRetry), current.abort.signal);
       }
     }
@@ -337,13 +394,17 @@ export function createZjoocStudyController({ document: doc, isEnabled, runtime, 
         let nextRateAttempt = 0;
         let rateAttempts = 0;
         let desiredRate: number | undefined;
+        let choice = getPlaybackRate();
+        let unavailable = false;
         while (!media.ended) {
           const pane = assertMedia();
+          const nextChoice = getPlaybackRate();
+          if (choice !== nextChoice) { choice = nextChoice; nextRateAttempt = 0; rateAttempts = 0; desiredRate = undefined; }
           if (failed || media.error) throw new Attention('视频播放遇到临时错误。');
           if (media.paused) throw new Attention('视频暂时停止，正在恢复播放。');
           if (media.readyState < media.HAVE_FUTURE_DATA || media.seeking) {
             emit({ phase: 'waiting', running: true, playbackRate: undefined,
-              message: '视频正在加载或缓冲，待播放就绪后再应用平台最高倍速。' });
+              message: '视频正在加载或缓冲，待播放就绪后再应用所选倍速。' });
             await waitFor(current, () => {
               assertMedia();
               if (failed || media.error) throw new Attention('视频加载遇到临时错误。');
@@ -357,14 +418,17 @@ export function createZjoocStudyController({ document: doc, isEnabled, runtime, 
           // A delayed or ineffective rate menu must not stop otherwise healthy playback.
           if (Date.now() >= nextRateAttempt) {
             if (desiredRate === undefined || Math.abs(media.playbackRate - desiredRate) > 0.001) showPlaybackMenu(pane);
-            const rate = readPlaybackRates(pane)[0];
+            const rates = readPlaybackRates(pane);
+            const rate = preferredPlaybackRate(choice, rates);
             desiredRate = rate?.rate;
+            unavailable = rates.length > 0 && choice !== 'highest' && !rate;
             if (rate && Math.abs(media.playbackRate - rate.rate) > 0.001) click(rate.element);
             nextRateAttempt = Date.now() + Math.min(times.retry * 2 ** Math.min(rateAttempts++, 5), times.maxRetry);
           }
           const applied = desiredRate !== undefined && Math.abs(media.playbackRate - desiredRate) < 0.001;
-          const message = applied ? `正在以播放器最高 ${media.playbackRate} 倍速播放。`
-            : desiredRate === undefined ? '视频已开始播放，正在等待平台倍速菜单就绪。' : `视频已开始播放，正在应用平台最高 ${desiredRate} 倍速。`;
+          const message = applied ? `正在以${choice === 'highest' ? '平台最高' : '所选'} ${media.playbackRate} 倍速播放。`
+            : unavailable ? `当前视频未提供所选 ${choice} 倍速，实际以 ${media.playbackRate} 倍速播放；请选择其他倍速。`
+              : desiredRate === undefined ? '视频已开始播放，正在等待平台倍速菜单就绪。' : `视频已开始播放，正在应用所选 ${desiredRate} 倍速。`;
           if (state.phase !== 'running' || state.playbackRate !== media.playbackRate || state.message !== message) emit({ phase: 'running', running: true, playbackRate: media.playbackRate, message });
           await delay(times.poll, current.abort.signal);
         }
@@ -409,7 +473,7 @@ export function createZjoocStudyController({ document: doc, isEnabled, runtime, 
       }, times.load, '课件仍在提交，等待结束后刷新。', true), '正在等待课件提交。');
       await retry(current, async () => {
         entry.refreshed = true;
-        session!.cursor = { chapterIndex: current.chapterIndex };
+        session!.cursor = { chapterIndex: current.chapterIndex, resourceId: resource.id };
         await persist();
       }, '正在保存刷新后的检查位置。');
       assertCurrent(current);
@@ -443,7 +507,7 @@ export function createZjoocStudyController({ document: doc, isEnabled, runtime, 
         if (worker !== current || current.abort.signal.aborted) return;
         const resource = readZjoocResources(doc).find(item => item.id === id && item.active);
         const pane = resource ? resourcePane(doc, resource) : undefined;
-        if (event.target instanceof win.HTMLIFrameElement && pane?.contains(event.target)) iframeFailed = true;
+        if (event.target instanceof win.HTMLElement && event.target.matches('iframe,embed,object') && pane?.contains(event.target)) iframeFailed = true;
       };
       doc.addEventListener('error', onError, true);
       try {
@@ -490,16 +554,26 @@ export function createZjoocStudyController({ document: doc, isEnabled, runtime, 
     while (worker === current && !current.abort.signal.aborted) try {
       await retry(current, () => waitFor(current, () => readZjoocChapters(doc).length ? true : undefined, times.load, '课程目录未加载完成。', true), '正在等待课程目录。');
       const chapters = readZjoocChapters(doc).map(item => item.key);
-      const firstChapter = Math.min(session?.cursor?.chapterIndex ?? 0, chapters.length,
-        ...(session?.processed ?? []).map(item => item.chapterIndex));
+      const start = session?.start;
+      if (start && chapters[start.chapterIndex] !== start.chapterKey) throw new ManualNavigation('本次起点所在目录已变化，已暂停。请打开目标内容并点击“从当前内容开始”。');
+      const chapterFloor = start?.chapterIndex ?? 0;
+      const firstChapter = Math.max(chapterFloor, Math.min(session?.cursor?.chapterIndex ?? chapterFloor, chapters.length,
+        ...(session?.processed ?? []).filter(item => item.chapterIndex >= chapterFloor).map(item => item.chapterIndex)));
       for (let chapterIndex = firstChapter; chapterIndex < chapters.length; chapterIndex++) {
         current.chapterIndex = chapterIndex;
+        if (start && chapterIndex === start.chapterIndex && readZjoocChapters(doc).some(item => item.active && item.key === start.chapterKey)) {
+          const visible = readZjoocResources(doc);
+          if (visible.length && !visible.some(item => item.id === start.resourceId)) throw new ManualNavigation('本次起点内容已变化，已暂停。请打开目标内容并点击“从当前内容开始”。');
+        }
         await retry(current, () => selectChapter(current, chapters[chapterIndex]), '正在等待章节内容。');
         const ids = readZjoocResources(doc).map(item => item.id);
+        const resourceFloor = start && chapterIndex === start.chapterIndex ? ids.indexOf(start.resourceId) : 0;
+        if (resourceFloor < 0) throw new ManualNavigation('本次起点内容已变化，已暂停。请打开目标内容并点击“从当前内容开始”。');
         const cursorId = session?.cursor?.chapterIndex === chapterIndex ? session.cursor.resourceId : undefined;
-        const firstResource = Math.min(cursorId ? Math.max(0, ids.indexOf(cursorId)) : 0,
+        if (start && cursorId && !ids.includes(cursorId)) throw new ManualNavigation('上次学习位置已不在本节，已暂停。请打开目标内容并点击“从当前内容开始”。');
+        const firstResource = Math.max(resourceFloor, Math.min(cursorId ? Math.max(0, ids.indexOf(cursorId)) : resourceFloor,
           ...(session?.processed ?? []).filter(item => item.chapterIndex === chapterIndex)
-            .map(item => ids.indexOf(item.resourceId)).filter(index => index >= 0));
+            .map(item => ids.indexOf(item.resourceId)).filter(index => index >= resourceFloor)));
         for (let resourceIndex = firstResource; resourceIndex < ids.length; resourceIndex++) {
           const id = ids[resourceIndex];
           assertCurrent(current);
@@ -545,18 +619,25 @@ export function createZjoocStudyController({ document: doc, isEnabled, runtime, 
         }
         const chapterConfirmed = () => {
           const resources = readZjoocResources(doc);
-          if (!resources.length || ids.some(id => !resources.some(item => item.id === id))) return undefined;
-          if (resources.some(item => !ids.includes(item.id) || (item.kind === 'unsupported' && !item.completed))) {
+          if (!resources.length) return undefined;
+          const floor = start && chapterIndex === start.chapterIndex ? resources.findIndex(item => item.id === start.resourceId) : 0;
+          if (floor < 0) throw new ManualNavigation('本次起点内容已变化，已暂停。请重新选择起点。');
+          const scoped = resources.slice(floor);
+          if (ids.slice(resourceFloor).some(id => !scoped.some(item => item.id === id))) {
+            if (start) throw new ManualNavigation('本节学习范围已变化，已暂停。请重新选择起点。');
+            return undefined;
+          }
+          if (scoped.some(item => !ids.includes(item.id) || (item.kind === 'unsupported' && !item.completed))) {
             session!.cursor = { chapterIndex };
             throw new ContentsChanged('本节内容已更新，正在重新检查。');
           }
-          if (resources.some(item => !item.completed)) return undefined;
+          if (scoped.some(item => !item.completed)) return undefined;
           syncVisibleConfirmations();
           return true;
         };
         const ready = chapterConfirmed();
         emit({ phase: ready ? 'waiting' : 'confirming', running: true,
-          message: ready ? '本节已确认，正在继续…' : '正在核对本节任务，全部确认完成后再进入下一节…' });
+          message: ready ? '本节学习范围已确认，正在继续…' : '正在核对本节学习范围，确认完成后再进入下一节…' });
         await retry(current, () => waitFor(current, chapterConfirmed, times.confirmation,
           '本节仍有任务未获平台确认，正在继续检测。', true), '正在等待本节任务确认。');
         assertCurrent(current);
@@ -567,12 +648,13 @@ export function createZjoocStudyController({ document: doc, isEnabled, runtime, 
       assertCurrent(current);
       // A growing or replaced directory must be rescanned rather than misreported as complete.
       if (readZjoocChapters(doc).map(item => item.key).join('|') !== chapters.join('|')) {
+        if (start) throw new ManualNavigation('课程目录发生变化，已暂停。请打开目标内容并重新选择起点。');
         if (session) session.cursor = { chapterIndex: 0 };
         throw new Attention('课程目录发生变化，正在重新检查全部章节。');
       }
       finishedCourse = current.courseKey;
       worker = undefined;
-      emit({ phase: 'complete', running: false, message: state.pendingConfirmation.length ? '已处理至课程最后一节，仍有内容待平台确认。' : '已完成至课程最后一节。' });
+      emit({ phase: 'complete', running: false, message: completionMessage() });
       return;
     } catch (error) {
       if (worker !== current || current.abort.signal.aborted || disposed) return;
@@ -583,12 +665,22 @@ export function createZjoocStudyController({ document: doc, isEnabled, runtime, 
     }
   }
 
+  function completionMessage(): string {
+    if (session?.start) return '本次起点至课程末尾的内容已获平台确认；起点之前的内容未检查。';
+    return state.pendingConfirmation.length ? '已处理至课程最后一节，仍有内容待平台确认。' : '已完成至课程最后一节。';
+  }
+
   async function evaluate(): Promise<void> {
     if (disposed || hidden) return;
     const route = readZjoocRoute(doc.location.href);
+    const activeVideo = route ? readZjoocResources(doc).find(resource => resource.active && resource.kind === 'video') : undefined;
+    const videoPane = activeVideo ? resourcePane(doc, activeVideo) : undefined;
+    const rates = videoPane ? readPlaybackRates(videoPane).map(item => item.rate).filter(isZjoocPlaybackRate) as number[] : [];
+    if (rates.join(',') !== state.availablePlaybackRates.join(',')) emit({ availablePlaybackRates: rates });
+    if (!activeVideo && state.playbackRate !== undefined) emit({ playbackRate: undefined });
     if (manualChange && (manualChange.courseKey !== route?.courseKey || (!manualChange.paused && !isEnabled()))) cancelManualChange();
+    if (!route) { cancelWorker(); emit({ phase: 'unsupported', running: false, message: '请先在“我的课程”点击“进入学习”，再启用自动学习。' }); return; }
     if (!isEnabled()) { cancelWorker(); emit({ phase: 'disabled', running: false, message: '浙学自动学习已关闭。' }); return; }
-    if (!route) { cancelWorker(); emit({ phase: 'unsupported', running: false, message: '请进入浙学课程学习详情页。' }); return; }
     if (reloadStarted) return;
     if (pendingResume) return;
     syncVisibleConfirmations();
@@ -606,6 +698,7 @@ export function createZjoocStudyController({ document: doc, isEnabled, runtime, 
         if (disposed || revision !== sessionRevision || readZjoocRoute(doc.location.href)?.courseKey !== route.courseKey) return;
         confirmed.clear(); pendingLabels.clear();
         session = saved?.courseKey === route.courseKey ? { ...saved,
+          start: saved.start ? { ...saved.start } : undefined,
           cursor: saved.cursor ? { ...saved.cursor } : undefined,
           processed: saved.processed?.map(item => ({ ...item })) }
           : { courseKey: route.courseKey, paused: false };
@@ -618,8 +711,12 @@ export function createZjoocStudyController({ document: doc, isEnabled, runtime, 
       if (!isEnabled() || hidden) { queueEvaluate(); return; }
     }
     if (session?.paused) { if (state.phase !== 'paused') emit({ phase: 'paused', running: false, message: '当前课程已暂停，点击继续将接着上次进度学习。' }); return; }
+    if (!session?.cursor && !session?.start && getStartMode() === 'current-forward') {
+      void changeManualState(route.courseKey, false, false, '', true);
+      return;
+    }
     if (finishedCourse === route.courseKey) {
-      if (state.phase !== 'complete') emit({ phase: 'complete', running: false, message: state.pendingConfirmation.length ? '已处理至课程最后一节，仍有内容待平台确认。' : '已完成至课程最后一节。' });
+      if (state.phase !== 'complete') emit({ phase: 'complete', running: false, message: completionMessage() });
       return;
     }
     const active = readZjoocChapters(doc).find(item => item.active);
@@ -633,7 +730,7 @@ export function createZjoocStudyController({ document: doc, isEnabled, runtime, 
     win.queueMicrotask(() => { evaluationQueued = false; void evaluate(); });
   }
   function onNavigation(event: Event): void {
-    if (ownClick || !worker) return;
+    if (ownClick || (!worker && (!manualChange || manualChange.paused))) return;
     const element = event.target instanceof win.Element ? event.target : undefined;
     if (element?.closest('#pane-Chapter .el-menu-item, [role="tab"][id^="tab-"]')) pause('已手动切换章节或内容。点击继续将接着上次进度学习。');
   }
@@ -662,6 +759,14 @@ export function createZjoocStudyController({ document: doc, isEnabled, runtime, 
       finishedCourse = '';
       emit({ phase: 'waiting', running: true, message: '正在读取本轮进度并继续…' });
       void changeManualState(route.courseKey, false, recheck);
+    },
+    startFromCurrent() {
+      const route = readZjoocRoute(doc.location.href);
+      if (!route || !isEnabled() || disposed || reloadStarted) { queueEvaluate(); return; }
+      cancelWorker();
+      finishedCourse = '';
+      emit({ phase: 'waiting', running: true, message: '正在将当前内容设为本次学习起点…' });
+      void changeManualState(route.courseKey, false, false, '', true);
     },
     stop() { if (!disposed) pause('已暂停，点击继续将接着上次进度学习。'); },
     settingsChanged: queueEvaluate,

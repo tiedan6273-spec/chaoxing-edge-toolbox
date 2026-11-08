@@ -1,19 +1,27 @@
-import { isSupportedContent } from '../../core/background-context';
+import { isSupportedContent, senderPlatform } from '../../core/background-context';
+import type { PlatformId } from '../../shared/sites';
 import { readStoredSettings } from '../toolbox-settings/background';
 import { isAnswerPageCommand, isAnswerPageResult } from './protocol';
 import { canUseQuestionAnswerOperation } from './permissions';
+import { assessmentResourceKey, createAnswerOwnership } from './ownership';
+import { onLocalBankChanged, validateLocalAnswerProof } from '../local-question-bank/background';
+import { bankCourseContext, type LocalAnswerProof } from '../local-question-bank/library-types';
 import { ANSWER_FRAME_PORT, type AnswerPageCommand, type AnswerPageResult, type QuestionPageSnapshot } from './types';
 
 interface Pending { resolve(result: AnswerPageResult): void; reject(error: Error): void; timer: ReturnType<typeof setTimeout> }
 interface Peer {
+  platform: PlatformId;
   port: chrome.runtime.Port; frameId: number; documentId?: string; snapshot?: QuestionPageSnapshot;
   pending: Map<string, Pending>; epoch: number; heartbeat?: ReturnType<typeof setInterval>;
+  flowAttempt?: string;
+  ownershipEpoch?: number;
 }
 export interface AnswerFrameSnapshot { frameId: number; documentId?: string; snapshot: QuestionPageSnapshot }
 
 /** Frame identity is assigned by Chrome, never by page messages. No secrets use this transport. */
 export function installQuestionAnswerBroker(): void {
   const tabs = new Map<number, Map<number, Peer>>();
+  const ownership = createAnswerOwnership<Peer>();
   const relevant = (peer: Peer) => peer.frameId === 0 || Boolean(peer.snapshot && peer.snapshot.scene !== 'unsupported')
     || /\/(?:work|exam)\//i.test(peer.port.sender?.url ?? '');
   const changed = (peers: Map<number, Peer>) => {
@@ -50,20 +58,24 @@ export function installQuestionAnswerBroker(): void {
   });
   const cancel = (peers: Map<number, Peer>) => {
     for (const peer of peers.values()) {
-      try { peer.port.postMessage({ kind: 'page-request', id: crypto.randomUUID(), command: { action: 'cancel' } }); } catch { /* Already gone. */ }
       fail(peer, new Error('答题已暂停。'));
+      const epoch = peer.ownershipEpoch;
+      void request(peer, { action: 'cancel' }).then(result => {
+        if (result.ok && epoch === peer.ownershipEpoch) ownership.release(peer);
+      }).catch(() => { /* Keep ownership until the frame acknowledges or disconnects. */ });
     }
   };
+  onLocalBankChanged(() => { for (const peers of tabs.values()) { const owner = peers.get(0); if (owner) owner.epoch++; cancel(peers); changed(peers); } });
   chrome.runtime.onConnect.addListener(port => {
     if (port.name !== ANSWER_FRAME_PORT) return;
-    if (!port.sender || !isSupportedContent(port.sender, 'chaoxing') || port.sender.frameId === undefined) { port.disconnect(); return; }
+    if (!port.sender || !isSupportedContent(port.sender) || port.sender.frameId === undefined) { port.disconnect(); return; }
     const tabId = port.sender.tab!.id!;
     const peers = tabs.get(tabId) ?? new Map<number, Peer>();
     tabs.set(tabId, peers);
     const frameId = port.sender.frameId;
     const previous = peers.get(frameId);
-    if (previous) { fail(previous); if (frameId === 0) cancel(peers); }
-    const peer: Peer = { port, frameId, documentId: port.sender.documentId, pending: new Map(), epoch: 0 };
+    if (previous) { fail(previous); ownership.release(previous); if (frameId === 0) cancel(peers); }
+    const peer: Peer = { port, frameId, platform: senderPlatform(port.sender)!, documentId: port.sender.documentId, pending: new Map(), epoch: 0 };
     peers.set(frameId, peer);
     if (frameId !== 0 && (relevant(peer) || previous && relevant(previous))) changed(peers);
     port.onDisconnect.addListener(() => {
@@ -71,6 +83,7 @@ export function installQuestionAnswerBroker(): void {
       void chrome.runtime.lastError;
       if (peers.get(frameId) !== peer) return;
       peers.delete(frameId); fail(peer);
+      ownership.release(peer);
       if (frameId !== 0 && relevant(peer)) changed(peers);
       if (frameId === 0) cancel(peers);
       if (!peers.size) tabs.delete(tabId);
@@ -98,7 +111,7 @@ export function installQuestionAnswerBroker(): void {
         if (message.operation === 'scan') {
           if (!canUseQuestionAnswerOperation(await readStoredSettings(), 'scan')) throw new Error('请先开启题目提取或批量答题。');
           checkOwner();
-          const results = await Promise.allSettled([...peers.values()].map(async target => {
+          const results = await Promise.allSettled([...peers.values()].filter(target => target.platform === peer.platform).map(async target => {
             const result = await request(target, { action: 'inspect' });
             if (peers.get(target.frameId) !== target || !result.ok || !result.snapshot) return undefined;
             target.snapshot = result.snapshot;
@@ -114,16 +127,25 @@ export function installQuestionAnswerBroker(): void {
         }
         checkOwner();
         const target = peers.get(message.frameId as number);
-        if (!target || target.documentId !== message.documentId) throw new Error('题目框架已更换，请重新扫描。');
+        if (!target || target.platform !== peer.platform || target.documentId !== message.documentId) throw new Error('题目框架已更换，请重新扫描。');
         if (command.action !== 'inspect' && command.action !== 'cancel') {
           if (!target.snapshot || target.snapshot.documentKey !== command.documentKey || target.snapshot.scopeKey !== command.scopeKey) throw new Error('题目已离开当前答题范围。');
           if ('key' in command && !target.snapshot.questions.some(question => question.key === command.key && question.fingerprint === command.fingerprint)) throw new Error('题目内容已变化，请重新扫描。');
           if (command.action === 'finish' && target.snapshot.scene !== 'chapter-test') throw new Error('自动保存或提交只用于章节测验联动。');
         }
+        if (command.action === 'write' && message.localProof !== undefined) {
+          if (!await validateLocalAnswerProof(message.localProof as LocalAnswerProof, bankCourseContext(port.sender?.url))) throw new Error('本地题库已删除、停用或改变，请重新匹配，未填写旧答案。');
+          checkOwner();
+        }
+        if (command.action === 'write' || command.action === 'flow' && command.operation !== 'inspect') {
+          ownership.claim(target.flowAttempt || assessmentResourceKey(target.port.sender?.url) || assessmentResourceKey(port.sender?.tab?.url), target);
+          target.ownershipEpoch = (target.ownershipEpoch ?? 0) + 1;
+        }
         const result = await request(target, command);
         checkOwner();
         if (peers.get(target.frameId) !== target) throw new Error('题目页面已更换，旧结果已丢弃。');
         if (result.snapshot) target.snapshot = result.snapshot;
+        if (command.action === 'flow' && command.operation === 'inspect' && result.flow?.attemptKey) target.flowAttempt = result.flow.attemptKey;
         return result;
       };
       void execute().then(result => {
@@ -135,6 +157,6 @@ export function installQuestionAnswerBroker(): void {
   });
   chrome.tabs.onRemoved.addListener(tabId => {
     const peers = tabs.get(tabId); tabs.delete(tabId);
-    for (const peer of peers?.values() ?? []) fail(peer);
+    for (const peer of peers?.values() ?? []) { fail(peer); ownership.release(peer); }
   });
 }

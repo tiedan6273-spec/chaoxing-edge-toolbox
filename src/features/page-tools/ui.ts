@@ -4,6 +4,7 @@ import { createQuestionExtractView } from '../question-extract/ui';
 import type { Settings } from '../toolbox-settings/types';
 import type { WorkspaceContext, WorkspaceView } from '../workspace-registry';
 import { createQuestionAnswerView } from '../question-answer/ui';
+import { getPlatform } from '../../shared/sites';
 
 /** Scenes with a shared question grid reuse its preview/copy UI instead of mounting extraction again. */
 export function createSceneToolsView(dependencies: WorkspaceContext, options: { includeExtraction?: boolean } = {}): WorkspaceView {
@@ -33,18 +34,19 @@ export function createPageToolsView(dependencies: WorkspaceContext): WorkspaceVi
   const scene = readPageContext(document);
   const answer = dependencies.questionAnswer && (scene === 'homework' || scene === 'exam')
     ? createQuestionAnswerView({ answer: dependencies.questionAnswer, openSettings: dependencies.openSettings, title: pageToolsTitle(scene) }) : undefined;
-  const tools = createSceneToolsView(dependencies, { includeExtraction: !answer });
+  const tools = getPlatform(location.href)?.id === 'chaoxing' ? createSceneToolsView(dependencies, { includeExtraction: !answer }) : undefined;
   if (answer) root.append(answer.element);
-  else (tools.element as HTMLDetailsElement).open = true;
-  root.append(tools.element);
+  else if (tools) (tools.element as HTMLDetailsElement).open = true;
+  if (tools) root.append(tools.element);
   return {
     element: root,
+    actions: answer?.actions,
     update(settings: Settings | undefined, saving: boolean): void {
       answer?.update(settings, saving);
-      tools.update(settings, saving);
+      tools?.update(settings, saving);
     },
     updatePage(context: PageContext): void { root.setAttribute('aria-label', `${pageToolsTitle(context)}辅助工具`); },
     refresh(): void { answer?.refresh?.(); },
-    dispose(): void { answer?.dispose(); tools.dispose(); root.remove(); },
+    dispose(): void { answer?.dispose(); tools?.dispose(); root.remove(); },
   };
 }

@@ -8,6 +8,9 @@ import { mountQuestionBankSettings } from '../features/question-bank/ui';
 import type { SettingsSection } from '../platform/settings-navigation';
 import { mountConfigBackup } from '../features/config-backup/ui';
 import { mountPacingSettings } from '../features/answer-pacing/ui';
+import { mountLocalBankManager } from '../features/local-question-bank/manager-ui';
+import { mountActivitySettings } from '../features/activity/ui';
+import { mountSavedQuestions } from '../features/saved-questions/ui';
 
 const sections = ['api', 'question-bank', 'features', 'floating'] as const;
 const cleanups: Array<() => void> = [];
@@ -21,13 +24,20 @@ if (updateRoot) cleanups.push(mountUpdateCheck(updateRoot));
 let disposeApi: (() => void) | undefined;
 let disposeBank: (() => void) | undefined;
 const apiRoot = document.getElementById('settings-api-form');
-const bankRoot = document.getElementById('settings-question-bank');
+const bankRoot = document.getElementById('settings-bank-form');
+const localRoot = document.getElementById('settings-local-bank');
+if (localRoot) cleanups.push(mountLocalBankManager(localRoot));
+const savedRoot = document.getElementById('settings-saved-questions');
+if (savedRoot) cleanups.push(mountSavedQuestions(savedRoot));
 function refreshCredentialForms(): void {
   disposeApi?.(); disposeBank?.();
   if (apiRoot) disposeApi = mountApiSettings(apiRoot);
   if (bankRoot) disposeBank = mountQuestionBankSettings(bankRoot);
 }
 refreshCredentialForms();
+const activityRoot = document.getElementById('settings-activity');
+const usageRoot = document.getElementById('settings-usage-overview');
+if (activityRoot && usageRoot) cleanups.push(mountActivitySettings(activityRoot, usageRoot));
 cleanups.push(() => { disposeApi?.(); disposeBank?.(); });
 const backupRoot = document.getElementById('settings-config-backup');
 if (backupRoot) cleanups.push(mountConfigBackup(backupRoot, refreshCredentialForms));
@@ -48,6 +58,7 @@ if (featureSettings) {
 }
 
 function navigate(section: SettingsSection): void {
+  document.querySelector<HTMLElement>('.page')!.dataset.section = section;
   for (const id of sections) {
     const panel = document.getElementById(`settings-${id}`);
     const link = document.querySelector<HTMLAnchorElement>(`a[href="#${id}"]`);
@@ -55,7 +66,7 @@ function navigate(section: SettingsSection): void {
     if (id === section) link?.setAttribute('aria-current', 'page');
     else link?.removeAttribute('aria-current');
   }
-  const titles: Record<SettingsSection, string> = { api: '学习通 API 设置', 'question-bank': '言溪题库设置', features: '功能设置', floating: '悬浮框设置' };
+  const titles: Record<SettingsSection, string> = { api: 'AI 与用量设置', 'question-bank': '题库管理', features: '功能设置', floating: '悬浮框设置' };
   document.title = `${titles[section]} · 学习工具箱`;
 }
 

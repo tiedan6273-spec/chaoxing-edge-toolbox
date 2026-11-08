@@ -41,6 +41,9 @@ export function isQuestionSnapshot(value: unknown): value is QuestionSnapshot {
     && ['single', 'multiple', 'judgement', 'completion', 'line', 'fill', 'reader', 'program', 'unsupported'].includes(String(value.kind))
     && text(value.stem, 32000) && typeof value.supported === 'boolean'
     && (value.markdown === undefined || text(value.markdown, QUESTION_MARKDOWN_LIMIT))
+    && (value.reviewData === undefined || object(value.reviewData) && isApplicableAnswer(value.reviewData.answer)
+      && text(value.reviewData.explanation, 32000) && (value.reviewData.score === undefined || text(value.reviewData.score, 100))
+      && (value.reviewData.maxScore === undefined || text(value.reviewData.maxScore, 100)))
     && (value.program === undefined || program(value.program))
     && (value.reason === undefined || text(value.reason, 1000)) && list(value.options, option)
     && (value.textRecognition === undefined || isQuestionTextRecognition(value.textRecognition))
@@ -60,7 +63,7 @@ export function isApplicableAnswer(value: unknown): value is ApplicableAnswer {
 }
 
 export function isPreparedQuestion(value: unknown): value is PreparedQuestion {
-  if (!object(value) || !isQuestionSnapshot(value.question) || !text(value.suggestionTitle, 32000) || !text(value.suggestionOptions, 64000)) return false;
+  if (!object(value) || !isQuestionSnapshot(value.question) || value.question.reviewData !== undefined || !text(value.suggestionTitle, 32000) || !text(value.suggestionOptions, 64000)) return false;
   if (!Array.isArray(value.images) || value.images.length > 16) return false;
   let size = 0;
   return value.images.every(image => {
@@ -81,6 +84,9 @@ export function isAnswerPageCommand(value: unknown): value is AnswerPageCommand 
   if (!object(value)) return false;
   if (value.action === 'inspect' || value.action === 'cancel') return true;
   if (!text(value.documentKey) || !text(value.scopeKey)) return false;
+  if (value.action === 'flow') return ['inspect', 'save', 'next'].includes(String(value.operation))
+    && (value.attemptKey === undefined || text(value.attemptKey)) && (value.pageKey === undefined || text(value.pageKey))
+    && (value.expected === undefined || list(value.expected, item => object(item) && text(item.key) && text(item.fingerprint) && text(item.version, 200000), 300));
   if (value.action === 'finish') return ['save', 'submit'].includes(String(value.policy))
     && list(value.expected, item => object(item) && text(item.key) && text(item.fingerprint) && text(item.version, 200000), 300);
   if (!text(value.key) || !text(value.fingerprint)) return false;
@@ -90,6 +96,10 @@ export function isAnswerPageCommand(value: unknown): value is AnswerPageCommand 
 
 export function isAnswerPageResult(value: unknown): value is AnswerPageResult {
   return object(value) && typeof value.ok === 'boolean' && (value.error === undefined || text(value.error, 2000))
+    && (value.flow === undefined || object(value.flow) && text(value.flow.attemptKey) && text(value.flow.pageKey)
+      && Number.isSafeInteger(value.flow.page) && Number(value.flow.page) >= 0 && Number(value.flow.page) <= 100000
+      && (value.flow.total === undefined || Number.isSafeInteger(value.flow.total) && Number(value.flow.total) > 0 && Number(value.flow.total) <= 100000)
+      && typeof value.flow.canNext === 'boolean' && typeof value.flow.terminal === 'boolean' && typeof value.flow.canSave === 'boolean' && text(value.flow.reason, 1000))
     && (value.warning === undefined || text(value.warning, 1000))
     && (value.snapshot === undefined || isQuestionPageSnapshot(value.snapshot))
     && (value.prepared === undefined || isPreparedQuestion(value.prepared))
